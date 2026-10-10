@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.agentscope.core.agui.event.AguiEvent;
 import io.agentscope.core.agui.model.AguiFunctionCall;
 import io.agentscope.core.agui.model.AguiMessage;
 import io.agentscope.core.agui.model.AguiResume;
@@ -29,12 +30,14 @@ import io.agentscope.core.agui.model.AguiToolCall;
 import io.agentscope.core.agui.model.AudioInputContent;
 import io.agentscope.core.agui.model.DocumentInputContent;
 import io.agentscope.core.agui.model.ImageInputContent;
+import io.agentscope.core.agui.model.InputContent;
 import io.agentscope.core.agui.model.InputContentDataSource;
 import io.agentscope.core.agui.model.InputContentUrlSource;
 import io.agentscope.core.agui.model.MessageContent;
 import io.agentscope.core.agui.model.RunAgentInput;
 import io.agentscope.core.agui.model.TextInputContent;
 import io.agentscope.core.agui.model.VideoInputContent;
+import io.agentscope.core.event.ConfirmResult;
 import io.agentscope.core.message.AudioBlock;
 import io.agentscope.core.message.Base64Source;
 import io.agentscope.core.message.ImageBlock;
@@ -46,6 +49,9 @@ import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.ToolUseBlock;
 import io.agentscope.core.message.URLSource;
 import io.agentscope.core.message.VideoBlock;
+import io.agentscope.core.util.JsonUtils;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -203,7 +209,250 @@ class AguiMessageConverterTest {
 
         assertEquals("msg-t1", msg.getId());
         assertEquals(MsgRole.TOOL, msg.getRole());
-        assertTrue(msg.hasContentBlocks(ToolResultBlock.class));
+        ToolResultBlock result = msg.getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals("tc-1", result.getId());
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+    }
+
+    @Test
+    void testConvertToolMessageWithEmptyContentStillProducesResultBlock() {
+        AguiMessage aguiMsg = AguiMessage.toolMessage("msg-t1", "tc-1", "");
+
+        Msg msg = converter.toMsg(aguiMsg);
+
+        assertEquals(MsgRole.TOOL, msg.getRole());
+        ToolResultBlock result = msg.getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals("tc-1", result.getId());
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+    }
+
+    @Test
+    void testConvertToolMessageWithNullContentStillProducesResultBlock() {
+        AguiMessage aguiMsg = new AguiMessage("msg-t1", "tool", null, null, "tc-1");
+
+        Msg msg = converter.toMsg(aguiMsg);
+
+        assertEquals(MsgRole.TOOL, msg.getRole());
+        ToolResultBlock result = msg.getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals("tc-1", result.getId());
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+    }
+
+    @Test
+    void testConvertToolMessageWithErrorProducesErrorState() {
+        AguiMessage aguiMsg =
+                new AguiMessage("msg-t1", "tool", null, null, "tc-1", "sandbox unavailable");
+
+        Msg msg = converter.toMsg(aguiMsg);
+
+        assertEquals(MsgRole.TOOL, msg.getRole());
+        ToolResultBlock result = msg.getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals("tc-1", result.getId());
+        assertEquals(ToolResultState.ERROR, result.getState());
+        assertEquals("sandbox unavailable", resultText(result));
+    }
+
+    @Test
+    void testConvertToolMessageWithErrorAndContentKeepsBoth() {
+        AguiMessage aguiMsg =
+                new AguiMessage(
+                        "msg-t1",
+                        "tool",
+                        new MessageContent.Text("partial output"),
+                        null,
+                        "tc-1",
+                        "sandbox unavailable");
+
+        Msg msg = converter.toMsg(aguiMsg);
+
+        ToolResultBlock result = msg.getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals("tc-1", result.getId());
+        assertEquals(ToolResultState.ERROR, result.getState());
+        assertEquals("sandbox unavailable\npartial output", resultText(result));
+    }
+
+    @Test
+    void testConvertToolMessageWithBlankErrorStaysSuccess() {
+        AguiMessage aguiMsg =
+                new AguiMessage(
+                        "msg-t1",
+                        "tool",
+                        new MessageContent.Text("Tool result here"),
+                        null,
+                        "tc-1",
+                        "   ");
+
+        Msg msg = converter.toMsg(aguiMsg);
+
+        ToolResultBlock result = msg.getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+        assertEquals("Tool result here", resultText(result));
+    }
+
+    @Test
+    void testDeserializeToolMessageWithErrorField() {
+        // The AG-UI `error` field was dropped silently: the codec disables
+        // FAIL_ON_UNKNOWN_PROPERTIES and the model had no binding for it.
+        String json =
+                "{\"id\":\"msg-t1\",\"role\":\"tool\",\"toolCallId\":\"tc-1\","
+                        + "\"error\":\"sandbox unavailable\"}";
+
+        AguiMessage aguiMsg = JsonUtils.getJsonCodec().fromJson(json, AguiMessage.class);
+
+        assertEquals("msg-t1", aguiMsg.getId());
+        assertEquals("tc-1", aguiMsg.getToolCallId());
+        assertEquals("sandbox unavailable", aguiMsg.getError());
+
+        ToolResultBlock result =
+                converter.toMsg(aguiMsg).getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals(ToolResultState.ERROR, result.getState());
+    }
+
+    @Test
+    void testToolMessageSerialisesNonNullContent() {
+        Msg failed =
+                Msg.builder()
+                        .id("msg-t13")
+                        .role(MsgRole.TOOL)
+                        .content(ToolResultBlock.error("tc-1", "sandbox unavailable"))
+                        .build();
+
+        String json = JsonUtils.getJsonCodec().toJson(converter.toAguiMessage(failed));
+        Map<?, ?> wire = JsonUtils.getJsonCodec().fromJson(json, Map.class);
+
+        assertNotNull(wire);
+        assertTrue(
+                wire.get("content") instanceof String,
+                "tool message content must be text or parts, never null: " + json);
+        assertEquals("[ERROR] sandbox unavailable", wire.get("error"));
+    }
+
+    @Test
+    void testConvertMixedToolResultsExpandsEachResult() {
+        Msg msg =
+                Msg.builder()
+                        .id("msg-t18")
+                        .role(MsgRole.TOOL)
+                        .content(
+                                ToolResultBlock.text("ok").withIdAndName("tc-0", "lookup"),
+                                ToolResultBlock.error("tc-1", "first failed"),
+                                ToolResultBlock.error("tc-2", "second failed"))
+                        .build();
+
+        List<AguiMessage> messages = converter.toAguiMessages(msg);
+
+        assertEquals(3, messages.size());
+        assertEquals("tc-0", messages.get(0).getToolCallId());
+        assertNull(messages.get(0).getError());
+        assertEquals("ok", messages.get(0).getTextContent());
+        assertEquals("tc-1", messages.get(1).getToolCallId());
+        assertEquals("[ERROR] first failed", messages.get(1).getError());
+        assertEquals("", messages.get(1).getTextContent());
+        assertEquals("tc-2", messages.get(2).getToolCallId());
+        assertEquals("[ERROR] second failed", messages.get(2).getError());
+        assertEquals("", messages.get(2).getTextContent());
+    }
+
+    @Test
+    void testConvertToolMessageWithErrorMarkerOnlyInContentStaysSuccess() {
+        // Marker-only content is not an AG-UI error report; the protocol's error field is the
+        // authoritative signal for a failed frontend tool.
+        AguiMessage aguiMsg =
+                AguiMessage.toolMessage("msg-t19", "tc-1", "[ERROR] sandbox unavailable");
+
+        ToolResultBlock result =
+                converter.toMsg(aguiMsg).getFirstContentBlock(ToolResultBlock.class);
+
+        assertNotNull(result);
+        assertEquals(ToolResultState.SUCCESS, result.getState());
+        assertEquals("[ERROR] sandbox unavailable", resultText(result));
+    }
+
+    @Test
+    void testConvertErrorToolResultOnAssistantRoleKeepsTextInContent() {
+        // A provider server tool reports its failure as an ERROR result inside the assistant
+        // response. `error` belongs to the protocol's tool message, so for this role the text has
+        // to stay in the content rather than move to a field the role does not define.
+        Msg msg =
+                Msg.builder()
+                        .id("msg-t20")
+                        .role(MsgRole.ASSISTANT)
+                        .content(
+                                ToolResultBlock.error(
+                                        "srv-1", "web search failed: too_many_requests"))
+                        .build();
+
+        AguiMessage aguiMsg = converter.toAguiMessage(msg);
+
+        assertEquals("assistant", aguiMsg.getRole());
+        assertNull(aguiMsg.getError());
+        assertEquals("[ERROR] web search failed: too_many_requests", aguiMsg.getTextContent());
+    }
+
+    @Test
+    void testToAguiMessageRejectsMultipleToolResults() {
+        Msg msg =
+                Msg.builder()
+                        .id("msg-t22")
+                        .role(MsgRole.TOOL)
+                        .content(ToolResultBlock.text("first"), ToolResultBlock.text("second"))
+                        .build();
+
+        IllegalArgumentException error =
+                assertThrows(IllegalArgumentException.class, () -> converter.toAguiMessage(msg));
+        assertTrue(error.getMessage().contains("toAguiMessages"));
+    }
+
+    @Test
+    void testErrorToolResultRoundTripsThroughBothDirections() {
+        AguiMessage original =
+                new AguiMessage(
+                        "msg-t4",
+                        "tool",
+                        new MessageContent.Text("partial output"),
+                        null,
+                        "tc-1",
+                        "sandbox unavailable");
+
+        AguiMessage roundTripped = converter.toAguiMessage(converter.toMsg(original));
+
+        // The payload sent alongside the error stays part of the error text, so the round trip
+        // carries both rather than dropping the payload.
+        assertEquals("sandbox unavailable\npartial output", roundTripped.getError());
+        assertEquals("tc-1", roundTripped.getToolCallId());
+
+        ToolResultBlock result =
+                converter.toMsg(roundTripped).getFirstContentBlock(ToolResultBlock.class);
+        assertNotNull(result);
+        assertEquals(ToolResultState.ERROR, result.getState());
+        assertEquals("sandbox unavailable\npartial output", resultText(result));
+    }
+
+    @Test
+    void testErrorOnNonToolRoleIsIgnored() {
+        // `error` is read only for tool messages; on any other role it stays a no-op rather than
+        // turning the message into a failed tool result.
+        AguiMessage aguiMsg =
+                new AguiMessage(
+                        "msg-t5",
+                        "assistant",
+                        new MessageContent.Text("Calling tool..."),
+                        null,
+                        null,
+                        "sandbox unavailable");
+
+        Msg msg = converter.toMsg(aguiMsg);
+
+        assertEquals(MsgRole.ASSISTANT, msg.getRole());
+        assertFalse(msg.hasContentBlocks(ToolResultBlock.class));
+        assertEquals("Calling tool...", msg.getFirstContentBlock(TextBlock.class).getText());
     }
 
     @Test
@@ -267,6 +516,26 @@ class AguiMessageConverterTest {
     }
 
     @Test
+    void testToAguiMessageListExpandsMultipleToolResults() {
+        Msg msg =
+                Msg.builder()
+                        .id("msg-tr2")
+                        .role(MsgRole.TOOL)
+                        .content(
+                                ToolResultBlock.error("tc-1", "first failed"),
+                                ToolResultBlock.error("tc-2", "second failed"))
+                        .build();
+
+        List<AguiMessage> messages = converter.toAguiMessageList(List.of(msg));
+
+        assertEquals(2, messages.size());
+        assertEquals("msg-tr2", messages.get(0).getId());
+        assertEquals("msg-tr2-1", messages.get(1).getId());
+        assertEquals("tc-1", messages.get(0).getToolCallId());
+        assertEquals("tc-2", messages.get(1).getToolCallId());
+    }
+
+    @Test
     void testConvertMsgWithMultipleTextBlocks() {
         Msg msg =
                 Msg.builder()
@@ -305,6 +574,9 @@ class AguiMessageConverterTest {
 
     @Test
     void testConvertRunInputResumeToToolResultMsgUsingKnownInterruptMapping() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "int-abc", "tool_call", "suspended", "tool-call-1", null, null, Map.of());
         RunAgentInput input =
                 RunAgentInput.builder()
                         .threadId("thread-1")
@@ -317,7 +589,7 @@ class AguiMessageConverterTest {
                                                 Map.of("approved", true))))
                         .build();
 
-        List<Msg> msgs = converter.toMsgList(input, Map.of("int-abc", "tool-call-1"));
+        List<Msg> msgs = converter.toMsgList(input, Map.of("int-abc", interrupt));
 
         assertEquals(1, msgs.size());
         assertEquals(MsgRole.TOOL, msgs.get(0).getRole());
@@ -466,7 +738,9 @@ class AguiMessageConverterTest {
         AguiMessage aguiMsg = converter.toAguiMessage(msg);
 
         assertEquals("tc-1", aguiMsg.getToolCallId());
-        assertNull(aguiMsg.getContent());
+        // This used to assert null. The protocol requires `content` on a tool message and does
+        // not accept null, so the field is now an empty string when the result has no output.
+        assertEquals("", aguiMsg.getTextContent());
     }
 
     @Test
@@ -566,6 +840,22 @@ class AguiMessageConverterTest {
     }
 
     @Test
+    void testNullInputContentIsRejectedWithoutDereferencingIt() throws Exception {
+        // Blocks rejects null elements, so exercise this defensive guard directly.
+        Method method =
+                AguiMessageConverter.class.getDeclaredMethod("toContentBlock", InputContent.class);
+        method.setAccessible(true);
+
+        InvocationTargetException exception =
+                assertThrows(
+                        InvocationTargetException.class,
+                        () -> method.invoke(converter, new Object[] {null}));
+
+        assertEquals(IllegalStateException.class, exception.getCause().getClass());
+        assertEquals("Unhandled InputContent type: null", exception.getCause().getMessage());
+    }
+
+    @Test
     void testConvertDocumentInputContentIsRejectedForUrlSource() {
         AguiMessage aguiMsg =
                 AguiMessage.userMessage(
@@ -573,11 +863,14 @@ class AguiMessageConverterTest {
                         List.of(
                                 new DocumentInputContent(
                                         new InputContentUrlSource("https://example.com/doc.pdf"),
-                                        null)));
+                                        Map.of("private", "private-metadata"))));
 
         IllegalStateException exception =
                 assertThrows(IllegalStateException.class, () -> converter.toMsg(aguiMsg));
-        assertTrue(exception.getMessage().startsWith("Unhandled InputContent type:"));
+        assertEquals(
+                "Unsupported AG-UI input content type 'document': document input is not supported"
+                        + " yet",
+                exception.getMessage());
     }
 
     @Test
@@ -588,11 +881,14 @@ class AguiMessageConverterTest {
                         List.of(
                                 new DocumentInputContent(
                                         new InputContentDataSource("dGVzdA==", "application/pdf"),
-                                        null)));
+                                        Map.of("private", "private-metadata"))));
 
         IllegalStateException exception =
                 assertThrows(IllegalStateException.class, () -> converter.toMsg(aguiMsg));
-        assertTrue(exception.getMessage().startsWith("Unhandled InputContent type:"));
+        assertEquals(
+                "Unsupported AG-UI input content type 'document': document input is not supported"
+                        + " yet",
+                exception.getMessage());
     }
 
     @Test
@@ -633,6 +929,445 @@ class AguiMessageConverterTest {
 
         // Empty blocks list should not produce any content blocks
         assertTrue(msg.getContent().isEmpty());
+    }
+
+    @Test
+    void testConvertConfirmationResumeResolvedBuildsConfirmResultWithNonNullContent() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "Tool 'echo' requires user confirmation before execution",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName", "echo",
+                                "toolInput", Map.of("message", "hello"),
+                                "toolContent", "{\"message\":\"hello\"}",
+                                "replyId", "reply-1",
+                                "agentscope.interruptKind", "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("approved", true))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        assertEquals(1, msgs.size());
+        Msg confirmMsg = msgs.get(0);
+        assertEquals(MsgRole.USER, confirmMsg.getRole());
+
+        Object raw = confirmMsg.getMetadata().get(Msg.METADATA_CONFIRM_RESULTS);
+        assertNotNull(raw);
+        assertTrue(raw instanceof List);
+        List<?> results = (List<?>) raw;
+        assertEquals(1, results.size());
+
+        ConfirmResult cr = (ConfirmResult) results.get(0);
+        assertTrue(cr.isConfirmed());
+        ToolUseBlock toolCall = cr.getToolCall();
+        assertNotNull(toolCall);
+        assertEquals("tool-call-1", toolCall.getId());
+        assertEquals("echo", toolCall.getName());
+        // Content must be non-null to avoid the resume validation failure.
+        assertNotNull(toolCall.getContent());
+        assertTrue(toolCall.getContent().contains("hello"));
+        assertEquals("hello", toolCall.getInput().get("message"));
+    }
+
+    @Test
+    void testConvertConfirmationResumeWithEditedArgsReplacesToolInputAndContent() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "Tool 'echo' requires user confirmation before execution",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName", "echo",
+                                "toolInput", Map.of("message", "hello", "drop", true),
+                                "toolContent", "{\"message\":\"hello\",\"drop\":true}",
+                                "replyId", "reply-1",
+                                "agentscope.interruptKind", "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of(
+                                                        "approved",
+                                                        true,
+                                                        "editedArgs",
+                                                        Map.of("message", "goodbye")))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        ConfirmResult cr =
+                (ConfirmResult)
+                        ((List<?>) msgs.get(0).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS))
+                                .get(0);
+        ToolUseBlock toolCall = cr.getToolCall();
+        assertTrue(cr.isConfirmed());
+        assertEquals(Map.of("message", "goodbye"), toolCall.getInput());
+        assertFalse(toolCall.getInput().containsKey("drop"));
+        assertTrue(toolCall.getContent().contains("goodbye"));
+        assertFalse(toolCall.getContent().contains("hello"));
+    }
+
+    @Test
+    void testConvertConfirmationResumeRejectsInvalidEditedArgs() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "confirm",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName",
+                                "echo",
+                                "toolContent",
+                                "{\"message\":\"hi\"}",
+                                "agentscope.interruptKind",
+                                "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("approved", true, "editedArgs", "oops"))))
+                        .build();
+
+        IllegalArgumentException error =
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt)));
+        assertTrue(error.getMessage().contains("editedArgs"));
+    }
+
+    @Test
+    void testConvertConfirmationResumeCancelledBuildsDeniedConfirmResult() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "confirm",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName",
+                                "echo",
+                                "toolContent",
+                                "{\"message\":\"hi\"}",
+                                "agentscope.interruptKind",
+                                "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_CANCELLED,
+                                                null)))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        ConfirmResult cr =
+                (ConfirmResult)
+                        ((List<?>) msgs.get(0).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS))
+                                .get(0);
+        assertFalse(cr.isConfirmed());
+        assertNotNull(cr.getToolCall().getContent());
+    }
+
+    @Test
+    void testConfirmationResumeRespectsExplicitApprovedFalsePayload() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "confirm",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName",
+                                "echo",
+                                "toolContent",
+                                "{\"message\":\"hi\"}",
+                                "agentscope.interruptKind",
+                                "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("approved", false))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        ConfirmResult cr =
+                (ConfirmResult)
+                        ((List<?>) msgs.get(0).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS))
+                                .get(0);
+        assertFalse(cr.isConfirmed());
+    }
+
+    @Test
+    void testConvertConfirmationResumeWithReasonCarriesDenialReason() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "confirm",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName",
+                                "shell",
+                                "toolContent",
+                                "{\"command\":\"date\"}",
+                                "agentscope.interruptKind",
+                                "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of(
+                                                        "approved",
+                                                        false,
+                                                        "reason",
+                                                        "production command is not allowed"))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        ConfirmResult cr =
+                (ConfirmResult)
+                        ((List<?>) msgs.get(0).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS))
+                                .get(0);
+        assertFalse(cr.isConfirmed());
+        assertEquals("production command is not allowed", cr.getReason());
+    }
+
+    @Test
+    void testConfirmationResumeWithoutApprovedFieldIsDenied() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "confirm",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName",
+                                "echo",
+                                "toolContent",
+                                "{\"message\":\"hi\"}",
+                                "agentscope.interruptKind",
+                                "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("comment", "looks fine"))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        ConfirmResult cr =
+                (ConfirmResult)
+                        ((List<?>) msgs.get(0).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS))
+                                .get(0);
+        assertFalse(cr.isConfirmed());
+    }
+
+    @Test
+    void testConfirmationResumeWithNonBooleanApprovedFieldIsDenied() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "confirm",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName",
+                                "echo",
+                                "toolContent",
+                                "{\"message\":\"hi\"}",
+                                "agentscope.interruptKind",
+                                "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("approved", "true"))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        ConfirmResult cr =
+                (ConfirmResult)
+                        ((List<?>) msgs.get(0).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS))
+                                .get(0);
+        assertFalse(cr.isConfirmed());
+    }
+
+    @Test
+    void testResumeWithoutConfirmationInterruptStillUsesToolResultPath() {
+        AguiEvent.Interrupt suspendInterrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "suspended",
+                        "tool-call-1",
+                        null,
+                        null,
+                        null);
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                "done")))
+                        .build();
+
+        List<Msg> msgs =
+                converter.toMsgList(input, Map.of("reply-1:tool-call-1", suspendInterrupt));
+
+        // Non-confirmation interrupt must still produce a TOOL-role ToolResultBlock message.
+        assertEquals(MsgRole.TOOL, msgs.get(0).getRole());
+        assertNotNull(msgs.get(0).getFirstContentBlock(ToolResultBlock.class));
+    }
+
+    @Test
+    void testCopilotKitDualPathSkipsDuplicateToolResultFromResume() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:call_x",
+                        "tool_call",
+                        "Need approval",
+                        "call_x",
+                        null,
+                        null,
+                        Map.of("toolName", "requestHumanApproval"));
+        String payload = "{\"approved\":true,\"reason\":\"ok\"}";
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .messages(List.of(AguiMessage.toolMessage("msg-tool", "call_x", payload)))
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:call_x",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("approved", true, "reason", "ok"))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:call_x", interrupt));
+
+        List<String> toolResultIds =
+                msgs.stream()
+                        .filter(m -> m.getRole() == MsgRole.TOOL)
+                        .map(m -> m.getFirstContentBlock(ToolResultBlock.class))
+                        .filter(r -> r != null)
+                        .map(ToolResultBlock::getId)
+                        .toList();
+        assertEquals(List.of("call_x"), toolResultIds);
+        assertEquals(1, msgs.size());
+        assertEquals(payload, resultText(msgs.get(0).getFirstContentBlock(ToolResultBlock.class)));
+    }
+
+    @Test
+    void testPermissionConfirmResumeKeptWhenToolMessageAlreadyPresent() {
+        AguiEvent.Interrupt interrupt =
+                new AguiEvent.Interrupt(
+                        "reply-1:tool-call-1",
+                        "tool_call",
+                        "Confirm?",
+                        "tool-call-1",
+                        null,
+                        null,
+                        Map.of(
+                                "toolName", "deploy_release",
+                                "toolInput", Map.of("env", "prod"),
+                                "toolContent", "{\"env\":\"prod\"}",
+                                "agentscope.interruptKind", "permission_confirm"));
+        RunAgentInput input =
+                RunAgentInput.builder()
+                        .threadId("thread-1")
+                        .runId("run-2")
+                        .messages(
+                                List.of(
+                                        AguiMessage.toolMessage(
+                                                "msg-tool", "tool-call-1", "{\"approved\":true}")))
+                        .resume(
+                                List.of(
+                                        new AguiResume(
+                                                "reply-1:tool-call-1",
+                                                AguiResume.STATUS_RESOLVED,
+                                                Map.of("approved", true))))
+                        .build();
+
+        List<Msg> msgs = converter.toMsgList(input, Map.of("reply-1:tool-call-1", interrupt));
+
+        assertEquals(2, msgs.size());
+        assertEquals(MsgRole.TOOL, msgs.get(0).getRole());
+        assertEquals(MsgRole.USER, msgs.get(1).getRole());
+        assertNotNull(msgs.get(1).getMetadata().get(Msg.METADATA_CONFIRM_RESULTS));
     }
 
     private static String resultText(ToolResultBlock result) {

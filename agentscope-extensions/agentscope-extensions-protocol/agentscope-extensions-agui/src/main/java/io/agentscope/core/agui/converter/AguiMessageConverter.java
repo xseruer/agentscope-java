@@ -15,12 +15,21 @@
  */
 package io.agentscope.core.agui.converter;
 
+import static io.agentscope.core.agui.AguiInterruptConstants.INTERRUPT_KIND_PERMISSION_CONFIRM;
+import static io.agentscope.core.agui.AguiInterruptConstants.METADATA_AGENTSCOPE_INTERRUPT_KIND;
+import static io.agentscope.core.agui.AguiInterruptConstants.METADATA_TOOL_CONTENT;
+import static io.agentscope.core.agui.AguiInterruptConstants.METADATA_TOOL_INPUT;
+import static io.agentscope.core.agui.AguiInterruptConstants.METADATA_TOOL_NAME;
+import static io.agentscope.core.agui.AguiInterruptConstants.TOOL_CALL_INTERRUPT_REASON;
+
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.agentscope.core.agui.event.AguiEvent;
 import io.agentscope.core.agui.model.AguiFunctionCall;
 import io.agentscope.core.agui.model.AguiMessage;
 import io.agentscope.core.agui.model.AguiResume;
 import io.agentscope.core.agui.model.AguiToolCall;
 import io.agentscope.core.agui.model.AudioInputContent;
+import io.agentscope.core.agui.model.DocumentInputContent;
 import io.agentscope.core.agui.model.ImageInputContent;
 import io.agentscope.core.agui.model.InputContent;
 import io.agentscope.core.agui.model.InputContentDataSource;
@@ -30,6 +39,7 @@ import io.agentscope.core.agui.model.MessageContent;
 import io.agentscope.core.agui.model.RunAgentInput;
 import io.agentscope.core.agui.model.TextInputContent;
 import io.agentscope.core.agui.model.VideoInputContent;
+import io.agentscope.core.event.ConfirmResult;
 import io.agentscope.core.message.AudioBlock;
 import io.agentscope.core.message.Base64Source;
 import io.agentscope.core.message.ContentBlock;
@@ -46,9 +56,13 @@ import io.agentscope.core.message.VideoBlock;
 import io.agentscope.core.util.JsonException;
 import io.agentscope.core.util.JsonUtils;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -58,6 +72,16 @@ import java.util.stream.Collectors;
  * message format and AgentScope's internal message format.
  */
 public class AguiMessageConverter {
+
+    /** AG-UI resume payload key: user approved the tool call. */
+    private static final String RESUME_PAYLOAD_APPROVED = "approved";
+
+    /** AG-UI resume payload key: full replacement tool arguments. */
+    private static final String RESUME_PAYLOAD_EDITED_ARGS = "editedArgs";
+
+    /** AG-UI resume payload key: optional reason supplied when denying the tool call. */
+    private static final String RESUME_PAYLOAD_REASON = "reason";
+
     /**
      * Creates a new AguiMessageConverter
      */
@@ -85,6 +109,10 @@ public class AguiMessageConverter {
             for (InputContent input : blocksContent.parts()) {
                 blocks.add(toContentBlock(input));
             }
+        } else if (aguiMessage.isToolMessage() && aguiMessage.getToolCallId() != null) {
+            // Tool message with no content (e.g. frontend tool returning nothing): still
+            // emit a ToolResultBlock so the pending tool call is resolved downstream.
+            addTextBlock(blocks, "", aguiMessage);
         }
 
         // Add tool calls if present (for assistant messages)
@@ -100,14 +128,61 @@ public class AguiMessageConverter {
     /**
      * Convert an AgentScope message to an AG-UI message.
      *
+     * <p>A TOOL message that carries multiple {@link ToolResultBlock}s cannot be represented by a
+     * single AG-UI tool message, because the protocol allows only one {@code toolCallId} and one
+     * {@code error} per message. Use {@link #toAguiMessages(Msg)} for that case.
+     *
      * @param msg The AgentScope message to convert
      * @return The converted AG-UI message
      */
     public AguiMessage toAguiMessage(Msg msg) {
+        List<AguiMessage> messages = toAguiMessages(msg);
+        if (messages.size() != 1) {
+            throw new IllegalArgumentException(
+                    "A TOOL message with multiple ToolResultBlocks must be converted with"
+                            + " toAguiMessages(Msg)");
+        }
+        return messages.get(0);
+    }
+
+    /**
+     * Convert an AgentScope message to one or more AG-UI messages.
+     *
+     * <p>Non-TOOL messages and TOOL messages with at most one tool result are converted one-to-one.
+     * A TOOL message with multiple tool results is expanded into one AG-UI tool message per
+     * result, preserving each result's {@code toolCallId}, content, and error state.
+     *
+     * @param msg The AgentScope message to convert
+     * @return The converted AG-UI messages, never empty
+     */
+    public List<AguiMessage> toAguiMessages(Msg msg) {
+        if (msg.getRole() != MsgRole.TOOL) {
+            return List.of(toSingleAguiMessage(msg));
+        }
+        List<ToolResultBlock> toolResults = msg.getContentBlocks(ToolResultBlock.class);
+        if (toolResults.size() <= 1) {
+            return List.of(toSingleAguiMessage(msg));
+        }
+        List<AguiMessage> messages = new ArrayList<>();
+        for (int i = 0; i < toolResults.size(); i++) {
+            messages.add(toolResultMessage(msg, toolResults.get(i), i));
+        }
+        return List.copyOf(messages);
+    }
+
+    /**
+     * Convert an AgentScope message that carries at most one tool result.
+     *
+     * @param msg The AgentScope message to convert
+     * @return The converted AG-UI message
+     */
+    private AguiMessage toSingleAguiMessage(Msg msg) {
         String role = convertRole(msg.getRole());
         StringBuilder content = new StringBuilder();
         List<AguiToolCall> toolCalls = new ArrayList<>();
         String toolCallId = null;
+        String error = null;
+        boolean toolMessage = msg.getRole() == MsgRole.TOOL;
 
         for (ContentBlock block : msg.getContent()) {
             if (block instanceof TextBlock tb) {
@@ -119,24 +194,65 @@ public class AguiMessageConverter {
                 toolCalls.add(toAguiToolCall(tub));
             } else if (block instanceof ToolResultBlock trb) {
                 toolCallId = trb.getId();
-                // Extract text content from tool result
-                for (ContentBlock output : trb.getOutput()) {
-                    if (output instanceof TextBlock tb) {
-                        if (content.length() > 0) {
-                            content.append("\n");
+                if (toolMessage && trb.getState() == ToolResultState.ERROR) {
+                    error = toolResultText(trb);
+                } else {
+                    for (ContentBlock output : trb.getOutput()) {
+                        if (output instanceof TextBlock tb) {
+                            if (content.length() > 0) {
+                                content.append("\n");
+                            }
+                            content.append(tb.getText());
                         }
-                        content.append(tb.getText());
                     }
                 }
             }
         }
 
+        // The protocol lists `content` as required on a tool message and does not accept null
+        String contentText = content.toString();
+        MessageContent wireContent =
+                contentText.isEmpty() && !toolMessage ? null : new MessageContent.Text(contentText);
+
         return new AguiMessage(
                 msg.getId(),
                 role,
-                content.length() > 0 ? new MessageContent.Text(content.toString()) : null,
+                wireContent,
                 toolCalls.isEmpty() ? null : toolCalls,
-                toolCallId);
+                toolCallId,
+                error);
+    }
+
+    /**
+     * Join the text blocks of a tool result into a single string
+     */
+    private static String toolResultText(ToolResultBlock trb) {
+        StringBuilder text = new StringBuilder();
+        for (ContentBlock output : trb.getOutput()) {
+            if (output instanceof TextBlock tb) {
+                if (text.length() > 0) {
+                    text.append("\n");
+                }
+                text.append(tb.getText());
+            }
+        }
+        return text.toString();
+    }
+
+    /**
+     * Build one AG-UI tool message from a single AgentScope tool result.
+     *
+     * <p>The first expanded message keeps the source message ID; later messages get an index
+     * suffix so every emitted AG-UI message has a distinct ID.
+     */
+    private AguiMessage toolResultMessage(Msg msg, ToolResultBlock result, int index) {
+        String id = index == 0 ? msg.getId() : msg.getId() + "-" + index;
+        String text = toolResultText(result);
+        boolean error = result.getState() == ToolResultState.ERROR;
+        MessageContent content =
+                error ? new MessageContent.Text("") : new MessageContent.Text(text);
+        return new AguiMessage(
+                id, convertRole(msg.getRole()), content, null, result.getId(), error ? text : null);
     }
 
     /**
@@ -161,32 +277,72 @@ public class AguiMessageConverter {
 
     /**
      * Convert an AG-UI run input to AgentScope messages, resolving resume entries through known
-     * interrupt-to-tool-call mappings when available.
+     * originating interrupts when available.
+     *
+     * <p>Some clients (notably CopilotKit {@code useInterrupt.resolve()}) send both a {@code
+     * role:"tool"} message and a matching {@code resume[]} entry for the same {@code toolCallId}.
+     * Ordinary tool resumes that would duplicate an already-present {@link ToolResultBlock} id are
+     * skipped so {@code ReActAgent} does not throw {@code Duplicate tool result ID}. Permission
+     * confirm resumes still produce a USER {@link ConfirmResult} message and are never skipped on
+     * that basis.
      *
      * @param input The AG-UI run input
-     * @param resumeToolCallIds Mapping from interrupt ID to tool call ID
+     * @param resumeInterrupts Mapping from interrupt ID to the originating interrupt
      * @return The converted AgentScope messages
      */
-    public List<Msg> toMsgList(RunAgentInput input, Map<String, String> resumeToolCallIds) {
+    public List<Msg> toMsgList(
+            RunAgentInput input, Map<String, AguiEvent.Interrupt> resumeInterrupts) {
         Objects.requireNonNull(input, "input cannot be null");
         List<Msg> msgs = new ArrayList<>(toMsgList(input.getMessages()));
+        Set<String> existingToolResultIds = collectToolResultIds(msgs);
+        Map<String, AguiEvent.Interrupt> interrupts =
+                resumeInterrupts != null ? resumeInterrupts : Map.of();
         for (AguiResume resume : input.getResume()) {
-            String toolCallId = resolveToolCallId(resume.getInterruptId(), resumeToolCallIds);
-            if (toolCallId != null && !toolCallId.isBlank()) {
+            AguiEvent.Interrupt interrupt = interrupts.get(resume.getInterruptId());
+            String toolCallId = resolveToolCallId(resume.getInterruptId(), interrupt);
+            if (toolCallId == null || toolCallId.isBlank()) {
+                continue;
+            }
+            if (isPermissionConfirmInterrupt(interrupt)) {
+                msgs.add(toConfirmResultMsg(resume, toolCallId, interrupt));
+            } else if (!existingToolResultIds.contains(toolCallId)) {
                 msgs.add(toToolResultMsg(resume, toolCallId));
+                existingToolResultIds.add(toolCallId);
             }
         }
         return List.copyOf(msgs);
     }
 
+    private static Set<String> collectToolResultIds(List<Msg> msgs) {
+        Set<String> ids = new HashSet<>();
+        for (Msg msg : msgs) {
+            if (msg.getContent() == null) {
+                continue;
+            }
+            for (ContentBlock block : msg.getContent()) {
+                if (block instanceof ToolResultBlock toolResult
+                        && toolResult.getId() != null
+                        && !toolResult.getId().isBlank()) {
+                    ids.add(toolResult.getId());
+                }
+            }
+        }
+        return ids;
+    }
+
     /**
      * Convert a list of AgentScope messages to AG-UI messages.
+     *
+     * <p>A TOOL message with multiple tool results is expanded into one AG-UI tool message per
+     * result.
      *
      * @param msgs The AgentScope messages to convert
      * @return The converted AG-UI messages
      */
     public List<AguiMessage> toAguiMessageList(List<Msg> msgs) {
-        return msgs.stream().map(this::toAguiMessage).collect(Collectors.toList());
+        return msgs.stream()
+                .flatMap(msg -> toAguiMessages(msg).stream())
+                .collect(Collectors.toList());
     }
 
     /**
@@ -228,18 +384,38 @@ public class AguiMessageConverter {
      * @param aguiMessage the source message (for role/tool-call-id context)
      */
     private void addTextBlock(List<ContentBlock> blocks, String text, AguiMessage aguiMessage) {
+        if (aguiMessage.isToolMessage() && aguiMessage.getToolCallId() != null) {
+            String error = aguiMessage.getError();
+            if (error != null && !error.isBlank()) {
+                blocks.add(
+                        ToolResultBlock.builder()
+                                .id(aguiMessage.getToolCallId())
+                                .output(
+                                        TextBlock.builder()
+                                                .text(
+                                                        text == null || text.isEmpty()
+                                                                ? error
+                                                                : error + "\n" + text)
+                                                .build())
+                                .state(ToolResultState.ERROR)
+                                .build());
+                return;
+            }
+            // Tool results must always carry a ToolResultBlock, even when the frontend
+            // returned empty content.
+            String resultText = text != null ? text : "";
+            blocks.add(
+                    ToolResultBlock.builder()
+                            .id(aguiMessage.getToolCallId())
+                            .output(TextBlock.builder().text(resultText).build())
+                            .state(ToolResultState.SUCCESS)
+                            .build());
+            return;
+        }
         if (text == null || text.isEmpty()) {
             return;
         }
-        if (aguiMessage.isToolMessage() && aguiMessage.getToolCallId() != null) {
-            blocks.add(
-                    ToolResultBlock.of(
-                            aguiMessage.getToolCallId(),
-                            null,
-                            TextBlock.builder().text(text).build()));
-        } else {
-            blocks.add(TextBlock.builder().text(text).build());
-        }
+        blocks.add(TextBlock.builder().text(text).build());
     }
 
     /**
@@ -266,12 +442,14 @@ public class AguiMessageConverter {
         if (input instanceof VideoInputContent video) {
             return VideoBlock.builder().source(toSource(video.source())).build();
         }
-        //        if (input instanceof DocumentInputContent doc) {
-        //            // AgentScope currently lacks a native DocumentBlock; falling back to
-        // DataBlock
-        //            return DataBlock.builder().source(toSource(doc.source())).build();
-        //        }
-        throw new IllegalStateException("Unhandled InputContent type: " + input);
+        if (input instanceof DocumentInputContent) {
+            throw new IllegalStateException(
+                    "Unsupported AG-UI input content type 'document': document input is not"
+                            + " supported yet");
+        }
+        throw new IllegalStateException(
+                "Unhandled InputContent type: "
+                        + (input == null ? "null" : input.getClass().getSimpleName()));
     }
 
     /**
@@ -361,6 +539,126 @@ public class AguiMessageConverter {
                 .build();
     }
 
+    /**
+     * Build a {@link Msg} carrying a {@link ConfirmResult} for a permission-mode tool confirmation
+     * resume.
+     *
+     * <p>The resulting Msg is a USER-role message whose metadata contains a single-entry {@code
+     * List<ConfirmResult>} under {@link Msg#METADATA_CONFIRM_RESULTS}. The {@code ToolUseBlock}
+     * inside the {@link ConfirmResult} is reconstructed from the originating interrupt metadata so
+     * that its {@code content} field (the tool arguments as a JSON-object string) is guaranteed
+     * non-null, avoiding the {@code "argument content is null"} bug in
+     * {@code ReActAgent.applyConfirmResults}.
+     *
+     * @param resume the AG-UI resume entry
+     * @param toolCallId the resolved tool call ID
+     * @param interrupt the originating interrupt containing tool metadata
+     * @return a USER-role Msg with the confirmation result
+     */
+    @SuppressWarnings("unchecked")
+    private Msg toConfirmResultMsg(
+            AguiResume resume, String toolCallId, AguiEvent.Interrupt interrupt) {
+        boolean approved = isApproved(resume);
+        Map<String, Object> metadata = interrupt.metadata();
+
+        String toolName = metadata != null ? stringValue(metadata.get(METADATA_TOOL_NAME)) : null;
+        Map<String, Object> toolInput = null;
+        String toolContent = null;
+        if (metadata != null) {
+            Object inputObj = metadata.get(METADATA_TOOL_INPUT);
+            if (inputObj instanceof Map) {
+                toolInput = toStringObjectMap(inputObj, METADATA_TOOL_INPUT);
+            }
+            toolContent = stringValue(metadata.get(METADATA_TOOL_CONTENT));
+        }
+        Map<String, Object> editedArgs = editedArgs(resume);
+        if (editedArgs != null) {
+            toolInput = editedArgs;
+            toolContent = serializeArguments(editedArgs);
+        }
+
+        ToolUseBlock toolUseBlock =
+                ToolUseBlock.builder()
+                        .id(toolCallId)
+                        .name(toolName)
+                        .input(toolInput)
+                        .content(toolContent)
+                        .build();
+
+        ConfirmResult confirmResult =
+                new ConfirmResult(approved, toolUseBlock, null, reason(resume));
+        return Msg.builder()
+                .id("agui-confirm-" + resume.getInterruptId())
+                .role(MsgRole.USER)
+                .textContent(approved ? "approved" : "denied")
+                .metadata(Map.of(Msg.METADATA_CONFIRM_RESULTS, List.of(confirmResult)))
+                .build();
+    }
+
+    /**
+     * Determine whether the user approved the tool.
+     *
+     * <p>If the status is {@code cancelled}, the tool is denied. Otherwise, only an explicit
+     * {@code approved: true} boolean field approves the tool.
+     */
+    @SuppressWarnings("unchecked")
+    private static boolean isApproved(AguiResume resume) {
+        if (resume.isCancelled()) {
+            return false;
+        }
+        Object payload = resume.getPayload();
+        if (payload instanceof Map<?, ?> map) {
+            return Boolean.TRUE.equals(map.get(RESUME_PAYLOAD_APPROVED));
+        }
+        return false;
+    }
+
+    private static Map<String, Object> editedArgs(AguiResume resume) {
+        Object payload = resume.getPayload();
+        if (!(payload instanceof Map<?, ?> map) || !map.containsKey(RESUME_PAYLOAD_EDITED_ARGS)) {
+            return null;
+        }
+        return toStringObjectMap(map.get(RESUME_PAYLOAD_EDITED_ARGS), RESUME_PAYLOAD_EDITED_ARGS);
+    }
+
+    private static Map<String, Object> toStringObjectMap(Object value, String fieldName) {
+        if (!(value instanceof Map<?, ?> map)) {
+            throw new IllegalArgumentException(fieldName + " must be a JSON object when present");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getKey() instanceof String key)) {
+                throw new IllegalArgumentException(
+                        fieldName + " must contain only string property names");
+            }
+            result.put(key, entry.getValue());
+        }
+        return Collections.unmodifiableMap(result);
+    }
+
+    private static String reason(AguiResume resume) {
+        Object payload = resume.getPayload();
+        if (!(payload instanceof Map<?, ?> map)) {
+            return null;
+        }
+        String reason = stringValue(map.get(RESUME_PAYLOAD_REASON));
+        return reason == null || reason.isBlank() ? null : reason;
+    }
+
+    private static String stringValue(Object value) {
+        return value instanceof String s ? s : null;
+    }
+
+    private static boolean isPermissionConfirmInterrupt(AguiEvent.Interrupt interrupt) {
+        if (interrupt == null || !TOOL_CALL_INTERRUPT_REASON.equals(interrupt.reason())) {
+            return false;
+        }
+        Map<String, Object> metadata = interrupt.metadata();
+        return metadata != null
+                && INTERRUPT_KIND_PERMISSION_CONFIRM.equals(
+                        metadata.get(METADATA_AGENTSCOPE_INTERRUPT_KIND));
+    }
+
     private String resumeContent(AguiResume resume) {
         if (resume.isCancelled()) {
             return "Interrupt cancelled by user";
@@ -379,15 +677,17 @@ public class AguiMessageConverter {
         }
     }
 
-    private String resolveToolCallId(String interruptId, Map<String, String> resumeToolCallIds) {
-        if (interruptId == null || interruptId.isBlank()) {
+    private String resolveToolCallId(String interruptId, AguiEvent.Interrupt interrupt) {
+        if (interrupt != null
+                && interrupt.toolCallId() != null
+                && !interrupt.toolCallId().isBlank()) {
+            return interrupt.toolCallId();
+        }
+        if (interrupt != null && !TOOL_CALL_INTERRUPT_REASON.equals(interrupt.reason())) {
             return null;
         }
-        if (resumeToolCallIds != null) {
-            String mapped = resumeToolCallIds.get(interruptId);
-            if (mapped != null && !mapped.isBlank()) {
-                return mapped;
-            }
+        if (interruptId == null || interruptId.isBlank()) {
+            return null;
         }
         int separator = interruptId.lastIndexOf(':');
         if (separator >= 0 && separator < interruptId.length() - 1) {

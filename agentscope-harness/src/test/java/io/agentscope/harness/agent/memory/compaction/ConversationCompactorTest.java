@@ -31,6 +31,9 @@ import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
+import io.agentscope.core.session.InMemorySessionLogStore;
+import io.agentscope.core.session.SessionKey;
+import io.agentscope.core.session.SessionRecorder;
 import io.agentscope.harness.agent.memory.MemoryFlushManager;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,6 +41,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.test.StepVerifier;
 
 /** Tests message routing between summarization, memory flushing, and the preserved tail. */
 class ConversationCompactorTest {
@@ -143,6 +147,116 @@ class ConversationCompactorTest {
         assertTrue(fixture.flushInputs.isEmpty());
     }
 
+    /** Verifies that memory-flush fallback does not swallow a user interruption. */
+    @Test
+    void compactIfNeeded_propagatesInterruptedMemoryFlush() {
+        RecordingModel model = new RecordingModel();
+        MemoryFlushManager flushManager = mock(MemoryFlushManager.class);
+        when(flushManager.flushMemories(any(RuntimeContext.class), anyList()))
+                .thenReturn(Mono.error(new InterruptedException("interrupted while flushing")));
+        ConversationCompactor compactor = new ConversationCompactor(model, flushManager);
+
+        StepVerifier.create(
+                        compactor.compactIfNeeded(
+                                mock(RuntimeContext.class),
+                                compactableMessages(),
+                                config(true),
+                                "agent-id",
+                                "session-id"))
+                .expectError(InterruptedException.class)
+                .verify();
+    }
+
+    /** Verifies that the durable compaction end event contains before and after metrics. */
+    @Test
+    void compactIfNeeded_recordsCompactionMetrics() {
+        InMemorySessionLogStore store = new InMemorySessionLogStore();
+        RuntimeContext runtimeContext =
+                RuntimeContext.builder().userId("user").sessionId("session").build();
+        var log = store.open(new SessionKey("user", "agent-id", "session"), runtimeContext);
+        SessionRecorder recorder = new SessionRecorder(log, "turn");
+        runtimeContext.put(SessionRecorder.CONTEXT_KEY, recorder);
+
+        List<Msg> input = compactableMessages();
+        MemoryFlushManager flushManager = new MemoryFlushManager(null, null);
+        try {
+            List<Msg> compacted =
+                    new ConversationCompactor(new RecordingModel(), flushManager)
+                            .compactIfNeeded(
+                                    runtimeContext, input, config(false), "agent-id", "session")
+                            .block()
+                            .orElseThrow();
+
+            var end =
+                    log.readAfter(0, 100).stream()
+                            .filter(event -> event.type().equals("compaction/end"))
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals("completed", end.data().get("status"));
+            assertEquals(input.size(), end.data().get("beforeMsgCount"));
+            assertEquals(
+                    TokenCounterUtil.calculateToken(input), end.data().get("beforeTokenCount"));
+            assertEquals(compacted.size(), end.data().get("afterMsgCount"));
+            assertEquals(
+                    TokenCounterUtil.calculateToken(compacted), end.data().get("afterTokenCount"));
+        } finally {
+            recorder.close();
+        }
+    }
+
+    /** Verifies that failed compaction records only metrics known before execution. */
+    @Test
+    void compactIfNeeded_failedEventOmitsAfterMetrics() {
+        InMemorySessionLogStore store = new InMemorySessionLogStore();
+        RuntimeContext runtimeContext =
+                RuntimeContext.builder().userId("user").sessionId("session").build();
+        var log = store.open(new SessionKey("user", "agent-id", "failed-session"), runtimeContext);
+        SessionRecorder recorder = new SessionRecorder(log, "turn");
+        runtimeContext.put(SessionRecorder.CONTEXT_KEY, recorder);
+        Model failingModel =
+                new Model() {
+                    @Override
+                    public Flux<ChatResponse> stream(
+                            List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+                        return Flux.error(new IllegalStateException("summary failed"));
+                    }
+
+                    @Override
+                    public String getModelName() {
+                        return "failing-model";
+                    }
+                };
+
+        List<Msg> input = compactableMessages();
+        try {
+            StepVerifier.create(
+                            new ConversationCompactor(
+                                            failingModel, new MemoryFlushManager(null, null))
+                                    .compactIfNeeded(
+                                            runtimeContext,
+                                            input,
+                                            config(false),
+                                            "agent-id",
+                                            "failed-session"))
+                    .expectErrorMessage("summary failed")
+                    .verify();
+
+            var end =
+                    log.readAfter(0, 100).stream()
+                            .filter(event -> event.type().equals("compaction/end"))
+                            .findFirst()
+                            .orElseThrow();
+            assertEquals("failed", end.data().get("status"));
+            assertEquals(input.size(), end.data().get("beforeMsgCount"));
+            assertEquals(
+                    TokenCounterUtil.calculateToken(input), end.data().get("beforeTokenCount"));
+            assertFalse(end.data().containsKey("afterMsgCount"));
+            assertFalse(end.data().containsKey("afterTokenCount"));
+        } finally {
+            recorder.close();
+        }
+    }
+
     /** Creates a regular user message. */
     private static Msg message(String text) {
         return Msg.builder()
@@ -157,6 +271,25 @@ class ConversationCompactorTest {
                 .role(MsgRole.USER)
                 .name(ConversationCompactor.SUMMARY_MSG_NAME)
                 .content(TextBlock.builder().text(text).build())
+                .build();
+    }
+
+    /** Creates an input that always triggers compaction and retains a two-message tail. */
+    private static List<Msg> compactableMessages() {
+        return List.of(message("M1"), message("M2"), message("TAIL_1"), message("TAIL_2"));
+    }
+
+    /** Creates focused compaction configuration for fallback-boundary tests. */
+    private static CompactionConfig config(boolean flushBeforeCompact) {
+        return CompactionConfig.builder()
+                .triggerMessages(3)
+                .triggerTokens(0)
+                .keepMessages(2)
+                .keepTokens(0)
+                .summaryPrompt("SUMMARY_INPUT:\n{messages}")
+                .flushBeforeCompact(flushBeforeCompact)
+                .truncateArgs(null)
+                .prune(null)
                 .build();
     }
 
@@ -195,18 +328,7 @@ class ConversationCompactorTest {
                                 return Mono.empty();
                             });
             compactor = new ConversationCompactor(model, flushManager);
-            config =
-                    CompactionConfig.builder()
-                            .triggerMessages(3)
-                            .triggerTokens(0)
-                            .keepMessages(2)
-                            .keepTokens(0)
-                            .summaryPrompt("SUMMARY_INPUT:\n{messages}")
-                            .flushBeforeCompact(flushBeforeCompact)
-                            .offloadBeforeCompact(false)
-                            .truncateArgs(null)
-                            .prune(null)
-                            .build();
+            config = config(flushBeforeCompact);
         }
 
         /** Runs compaction and requires the supplied input to trigger it. */
