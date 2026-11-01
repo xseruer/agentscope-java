@@ -27,6 +27,7 @@ import io.agentscope.harness.agent.sandbox.WorkspaceMountSupport;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.time.Duration;
+import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -87,7 +88,13 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
     @Override
     protected ExecResult doExec(RuntimeContext runtimeContext, String command, int timeoutSeconds)
             throws Exception {
-        String wrapped = "cd " + shellQuote(k8sState.getWorkspaceRoot()) + " && (" + command + ")";
+        requireActiveConnection();
+        if (command == null || command.isBlank()) {
+            throw new SandboxException.ExecException(
+                    2, "", "empty command rejected by KubernetesSandbox");
+        }
+        String wrapped =
+                "cd " + shellQuote(k8sState.getWorkspaceRoot()) + " && (\n" + command + "\n)";
         ExecutionResult result =
                 sdkSandbox.commands().run(wrapped, Duration.ofSeconds(Math.max(timeoutSeconds, 1)));
 
@@ -104,6 +111,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
 
     @Override
     protected InputStream doPersistWorkspace() throws Exception {
+        requireActiveConnection();
         String root = k8sState.getWorkspaceRoot();
         StringBuilder tarArgs = new StringBuilder();
         // The temp archive may live inside the workspace when the file API is rooted there;
@@ -121,7 +129,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
     }
 
     private InputStream persistViaFileApi(String root, String tarArgs) throws Exception {
-        String tmpRel = TMP_DIR_REL + "/ws-persist-" + sessionHash() + ".tar";
+        String tmpRel = TMP_DIR_REL + "/" + tempArchiveName("ws-persist") + ".tar";
         String tmpAbs = fileApiPath(tmpRel);
         String tarCmd =
                 "mkdir -p "
@@ -162,6 +170,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
 
     @Override
     protected void doHydrateWorkspace(InputStream archive) throws Exception {
+        requireActiveConnection();
         String root = k8sState.getWorkspaceRoot();
         sdkSandbox.commands().run("mkdir -p " + shellQuote(root));
 
@@ -174,7 +183,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
     }
 
     private void hydrateViaFileApi(String root, byte[] tarBytes) throws Exception {
-        String tmpRel = TMP_DIR_REL + "/ws-hydrate-" + sessionHash() + ".tar";
+        String tmpRel = TMP_DIR_REL + "/" + tempArchiveName("ws-hydrate") + ".tar";
         String tmpAbs = fileApiPath(tmpRel);
         sdkSandbox.files().write(tmpRel, tarBytes);
         try {
@@ -186,7 +195,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
 
     private void hydrateViaExec(String root, byte[] tarBytes) throws Exception {
         String b64 = java.util.Base64.getEncoder().encodeToString(tarBytes);
-        String tmpTar = "/tmp/ws-hydrate-" + sessionHash() + ".tar";
+        String tmpTar = "/tmp/" + tempArchiveName("ws-hydrate") + ".tar";
 
         String writeCmd = "echo '" + b64 + "' | base64 -d > " + tmpTar;
         ExecutionResult writeResult = sdkSandbox.commands().run(writeCmd);
@@ -261,6 +270,7 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
 
     @Override
     public void uploadFile(String absolutePath, byte[] content) throws Exception {
+        requireActiveConnection();
         String rel = requireFileApiRelative(absolutePath);
         int slash = absolutePath.lastIndexOf('/');
         if (slash > 0) {
@@ -280,7 +290,16 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
 
     @Override
     public byte[] downloadFile(String absolutePath) throws Exception {
+        requireActiveConnection();
         return sdkSandbox.files().read(requireFileApiRelative(absolutePath));
+    }
+
+    private void requireActiveConnection() {
+        if (!sdkSandbox.isActive()) {
+            throw new SandboxException.SandboxRuntimeException(
+                    SandboxErrorCode.SANDBOX_CONNECTION_CLOSED,
+                    "Kubernetes sandbox connection has been closed");
+        }
     }
 
     /**
@@ -330,6 +349,16 @@ public class KubernetesSandbox extends AbstractBaseSandbox implements SandboxFil
 
     private String sessionHash() {
         return Integer.toHexString(Math.abs(k8sState.getSessionId().hashCode()));
+    }
+
+    /**
+     * Temp archive name unique per transfer. Concurrent hydrate/persist calls on the same
+     * sandbox must not share a name: with a deterministic name, one call's {@code rm -f}
+     * cleanup deletes another call's archive between its upload and {@code tar -xf},
+     * failing the extraction with "Cannot open: No such file or directory".
+     */
+    private String tempArchiveName(String prefix) {
+        return prefix + "-" + sessionHash() + "-" + UUID.randomUUID();
     }
 
     private static String shellQuote(String s) {
