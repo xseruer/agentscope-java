@@ -21,6 +21,7 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.AgentResultEvent;
 import io.agentscope.core.event.ConfirmResult;
+import io.agentscope.core.formatter.DocumentReferenceRenderer;
 import io.agentscope.core.message.GenerateReason;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
@@ -34,9 +35,9 @@ import io.agentscope.harness.agent.subagent.protocol.RemoteEventType;
 import io.agentscope.harness.agent.subagent.protocol.RemotePendingConfirm;
 import io.agentscope.harness.agent.subagent.task.TaskRecord;
 import io.agentscope.harness.agent.subagent.task.TaskStatus;
-import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,31 +49,36 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 
 /**
- * In-memory execution handles with workspace-backed {@link TaskRecord} persistence.
+ * In-memory execution handles with control-plane {@link TaskRecord} persistence.
  *
- * <p>Each submitted task obtains a {@link HarnessAgent} instance via the {@code agentSupplier}.
- * For concurrent task execution, supply a factory that returns a new instance per call (e.g. a
- * Spring prototype-scoped bean). When a singleton bean is supplied, concurrent tasks will fail
- * at the agent level unless the agent is configured with {@code checkRunning(false)}.
+ * <p>Each run resolves its {@link HarnessAgent} through the {@link AgentFactory}, which receives
+ * the submission context and can therefore route per task. For concurrent task execution, return a
+ * new instance per call (e.g. a Spring prototype-scoped bean); a shared instance requires the agent
+ * to be configured with {@code checkRunning(false)}.
+ *
+ * <p>Task metadata is stored via {@link ProtocolTaskRepository} (a dedicated control-plane path),
+ * not via any execution agent's workspace. Caller-supplied {@code context.attributes} reach the
+ * run through its {@link RuntimeContext}; see {@link RuntimeContextCustomizer} for controlling how.
  */
 public final class AgentProtocolTaskStore {
 
     private static final Logger log = LoggerFactory.getLogger(AgentProtocolTaskStore.class);
     private static final ObjectMapper JSON = new ObjectMapper();
+    static final int TASK_LOCK_STRIPE_COUNT = 64;
 
     /** Sentinel returned when the agent paused for HITL confirmation. */
     static final String AWAITING_CONFIRM_SENTINEL = "__awaiting_confirm__";
 
-    private final Supplier<HarnessAgent> agentSupplier;
-    private final WorkspaceManager workspaceManager;
-    private final AgentProtocolTaskEventBus eventBus;
+    private final AgentFactory agentFactory;
+    private final ProtocolTaskRepository taskRepository;
+    private final AgentProtocolEventBus eventBus;
     private final AgentProtocolProperties properties;
+    private final List<RuntimeContextCustomizer> runtimeContextCustomizers;
     private final ExecutorService executor =
             Executors.newCachedThreadPool(
                     r -> {
@@ -85,31 +91,48 @@ public final class AgentProtocolTaskStore {
     private final Map<String, CompletableFuture<String>> futures = new ConcurrentHashMap<>();
     private final Map<String, SubmitContext> submitContexts = new ConcurrentHashMap<>();
 
+    /** Fixed stripes bound lock storage while serializing submit and resume transitions. */
+    private final Object[] taskLocks = createTaskLockStripes();
+
     public AgentProtocolTaskStore(
-            Supplier<HarnessAgent> agentSupplier,
-            WorkspaceManager workspaceManager,
-            AgentProtocolTaskEventBus eventBus,
+            AgentFactory agentFactory,
+            ProtocolTaskRepository taskRepository,
+            AgentProtocolEventBus eventBus,
             AgentProtocolProperties properties) {
-        this.agentSupplier = Objects.requireNonNull(agentSupplier, "agentSupplier");
-        this.workspaceManager = Objects.requireNonNull(workspaceManager, "workspaceManager");
-        this.eventBus = eventBus != null ? eventBus : new AgentProtocolTaskEventBus();
-        this.properties = properties != null ? properties : new AgentProtocolProperties();
+        this(agentFactory, taskRepository, eventBus, properties, List.of());
     }
 
     public AgentProtocolTaskStore(
-            Supplier<HarnessAgent> agentSupplier, WorkspaceManager workspaceManager) {
+            AgentFactory agentFactory,
+            ProtocolTaskRepository taskRepository,
+            AgentProtocolEventBus eventBus,
+            AgentProtocolProperties properties,
+            List<RuntimeContextCustomizer> runtimeContextCustomizers) {
+        this.agentFactory = Objects.requireNonNull(agentFactory, "agentFactory");
+        this.taskRepository = Objects.requireNonNull(taskRepository, "taskRepository");
+        this.eventBus = eventBus != null ? eventBus : new AgentProtocolTaskEventBus();
+        this.properties = properties != null ? properties : new AgentProtocolProperties();
+        this.runtimeContextCustomizers =
+                runtimeContextCustomizers == null
+                        ? List.of()
+                        : List.copyOf(runtimeContextCustomizers);
+    }
+
+    public AgentProtocolTaskStore(
+            AgentFactory agentFactory, ProtocolTaskRepository taskRepository) {
         this(
-                agentSupplier,
-                workspaceManager,
+                agentFactory,
+                taskRepository,
                 new AgentProtocolTaskEventBus(),
                 new AgentProtocolProperties());
     }
 
-    public AgentProtocolTaskStore(HarnessAgent harnessAgent, WorkspaceManager workspaceManager) {
-        this(() -> harnessAgent, workspaceManager);
+    public AgentProtocolTaskStore(
+            HarnessAgent harnessAgent, ProtocolTaskRepository taskRepository) {
+        this(AgentFactory.fixed(harnessAgent), taskRepository);
     }
 
-    public AgentProtocolTaskEventBus eventBus() {
+    public AgentProtocolEventBus eventBus() {
         return eventBus;
     }
 
@@ -124,42 +147,47 @@ public final class AgentProtocolTaskStore {
     }
 
     public void submit(String taskId, String agentId, String input, Map<String, Object> context) {
-        Optional<TaskRecord> existing =
-                workspaceManager.readTaskRecord(
-                        RuntimeContext.empty(),
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        taskId);
-        if (existing.isPresent() && existing.get().getStatus().isTerminal()) {
-            throw new IllegalStateException("task_id already finished: " + taskId);
+        Object lock = taskLockFor(taskId);
+        synchronized (lock) {
+            Optional<TaskRecord> existing = taskRepository.find(taskId);
+            if (existing.isPresent() && existing.get().getStatus().isTerminal()) {
+                throw new IllegalStateException("task_id already finished: " + taskId);
+            }
+            CompletableFuture<String> prior = futures.get(taskId);
+            if (prior != null && !prior.isDone()) {
+                return;
+            }
+
+            SubmitContext ctx = SubmitContext.from(context);
+            submitContexts.put(taskId, ctx);
+
+            TaskRecord pending =
+                    new TaskRecord(
+                            taskId,
+                            agentId != null ? agentId : "default",
+                            AgentProtocolConstants.PROTOCOL_AGENT_ID,
+                            AgentProtocolConstants.PROTOCOL_SESSION_ID,
+                            null);
+            pending.setStatus(TaskStatus.PENDING);
+            persist(pending);
+
+            CompletableFuture<String> f =
+                    CompletableFuture.supplyAsync(
+                            () -> runAgent(taskId, agentId, input, ctx, null), executor);
+            futures.put(taskId, f);
+            f.whenComplete((r, ex) -> futures.remove(taskId, f));
         }
-        CompletableFuture<String> prior = futures.get(taskId);
-        if (prior != null && !prior.isDone()) {
-            return;
-        }
-
-        SubmitContext ctx = SubmitContext.from(context);
-        submitContexts.put(taskId, ctx);
-
-        TaskRecord pending =
-                new TaskRecord(
-                        taskId,
-                        agentId != null ? agentId : "default",
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        null);
-        pending.setStatus(TaskStatus.PENDING);
-        persist(pending);
-
-        CompletableFuture<String> f =
-                CompletableFuture.supplyAsync(
-                        () -> runAgent(taskId, agentId, input, ctx, null), executor);
-        futures.put(taskId, f);
-        f.whenComplete((r, ex) -> futures.remove(taskId));
     }
 
     /**
      * Resumes a task paused for HITL confirmation with the given decisions.
+     *
+     * <p>The {@code awaiting_confirm} record is the pause signal: the paused run persists it
+     * before its future completes and performs no further agent work afterwards, so a client may
+     * legitimately call this while that future is still unwinding (a fast poll of {@link
+     * #snapshot} or the REQUIRE_CONFIRM event lands in that window). The record, re-validated
+     * under a per-task lock, is therefore what decides — the lock also keeps concurrent resumes
+     * from double-starting the next run.
      *
      * @throws IllegalStateException if the task is not awaiting confirmation
      */
@@ -167,38 +195,43 @@ public final class AgentProtocolTaskStore {
         if (!properties.isHitlEnabled()) {
             throw new IllegalStateException("HITL is disabled on this server");
         }
-        Optional<TaskRecord> existing =
-                workspaceManager.readTaskRecord(
-                        RuntimeContext.empty(),
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        taskId);
-        if (existing.isEmpty() || !existing.get().isAwaitingConfirm()) {
-            throw new IllegalStateException("task is not awaiting confirmation: " + taskId);
+        Object lock = taskLockFor(taskId);
+        synchronized (lock) {
+            Optional<TaskRecord> existing = taskRepository.find(taskId);
+            if (existing.isEmpty() || !existing.get().isAwaitingConfirm()) {
+                throw new IllegalStateException("task is not awaiting confirmation: " + taskId);
+            }
+            TaskRecord rec = existing.get();
+
+            List<RemotePendingConfirm> pending =
+                    rec.getPendingConfirms() != null ? rec.getPendingConfirms() : List.of();
+            List<ConfirmResult> confirmResults = toConfirmResults(pending, decisions);
+
+            rec.setAwaitingConfirm(false);
+            rec.setPendingConfirms(null);
+            rec.setStatus(TaskStatus.RUNNING);
+            persist(rec);
+
+            SubmitContext ctx = submitContexts.getOrDefault(taskId, SubmitContext.empty());
+            String agentId = rec.getSubAgentId();
+            String dummyInput = ""; // resume uses confirm metadata, not a new user prompt
+            CompletableFuture<String> f =
+                    CompletableFuture.supplyAsync(
+                            () -> runAgent(taskId, agentId, dummyInput, ctx, confirmResults),
+                            executor);
+            futures.put(taskId, f);
+            f.whenComplete((r, ex) -> futures.remove(taskId, f));
         }
-        TaskRecord rec = existing.get();
-        CompletableFuture<String> prior = futures.get(taskId);
-        if (prior != null && !prior.isDone()) {
-            throw new IllegalStateException("task is already running: " + taskId);
-        }
+    }
 
-        List<RemotePendingConfirm> pending =
-                rec.getPendingConfirms() != null ? rec.getPendingConfirms() : List.of();
-        List<ConfirmResult> confirmResults = toConfirmResults(pending, decisions);
+    private Object taskLockFor(String taskId) {
+        return taskLocks[Math.floorMod(taskId.hashCode(), taskLocks.length)];
+    }
 
-        rec.setAwaitingConfirm(false);
-        rec.setPendingConfirms(null);
-        rec.setStatus(TaskStatus.RUNNING);
-        persist(rec);
-
-        SubmitContext ctx = submitContexts.getOrDefault(taskId, SubmitContext.empty());
-        String agentId = rec.getSubAgentId();
-        String dummyInput = ""; // resume uses confirm metadata, not a new user prompt
-        CompletableFuture<String> f =
-                CompletableFuture.supplyAsync(
-                        () -> runAgent(taskId, agentId, dummyInput, ctx, confirmResults), executor);
-        futures.put(taskId, f);
-        f.whenComplete((r, ex) -> futures.remove(taskId));
+    private static Object[] createTaskLockStripes() {
+        Object[] locks = new Object[TASK_LOCK_STRIPE_COUNT];
+        Arrays.setAll(locks, ignored -> new Object());
+        return locks;
     }
 
     private String runAgent(
@@ -209,11 +242,16 @@ public final class AgentProtocolTaskStore {
             List<ConfirmResult> confirmResults) {
         try {
             updateRunning(taskId, agentId);
-            RuntimeContext.Builder ctxBuilder = RuntimeContext.builder().sessionId(taskId);
-            if (submitCtx.userId() != null) {
-                ctxBuilder.userId(submitCtx.userId());
-            }
-            RuntimeContext ctx = ctxBuilder.build();
+            AgentRequest request =
+                    new AgentRequest(
+                            taskId,
+                            agentId,
+                            input,
+                            submitCtx.userId(),
+                            submitCtx.parentSessionId(),
+                            confirmResults != null,
+                            submitCtx.raw());
+            RuntimeContext ctx = buildRuntimeContext(request);
 
             Msg.Builder msgBuilder =
                     Msg.builder().role(MsgRole.USER).textContent(input != null ? input : "");
@@ -224,7 +262,11 @@ public final class AgentProtocolTaskStore {
             }
             Msg msg = msgBuilder.build();
 
-            HarnessAgent agent = agentSupplier.get();
+            HarnessAgent agent = agentFactory.create(request);
+            if (agent == null) {
+                throw new IllegalStateException(
+                        "AgentFactory returned no agent for agent_id=" + agentId);
+            }
             AtomicReference<Msg> resultRef = new AtomicReference<>();
             String detail = submitCtx.detail();
 
@@ -238,10 +280,7 @@ public final class AgentProtocolTaskStore {
                                     return;
                                 }
                                 RemoteEventCodec.fromAgentEvent(event)
-                                        .filter(
-                                                dto ->
-                                                        RemoteEventCodec.matchesDetail(
-                                                                dto.getType(), detail))
+                                        .filter(dto -> RemoteEventCodec.matchesDetail(dto, detail))
                                         .ifPresent(
                                                 dto -> {
                                                     dto.setAgentId(agentId);
@@ -265,15 +304,18 @@ public final class AgentProtocolTaskStore {
                 return AWAITING_CONFIRM_SENTINEL;
             }
 
-            String text = reply != null ? reply.getTextContent() : "";
+            // The task result is a string, so a delivered document cannot travel as a block;
+            // render a reference instead of storing an empty reply.
+            String text = DocumentReferenceRenderer.renderMessageText(reply);
+            clearSubmitContext(taskId);
             update(taskId, TaskStatus.COMPLETED, text, null, agentId, false, null);
             publishStatus(taskId, agentId, "success", null);
             eventBus.complete(taskId);
-            clearSubmitContext(taskId);
             return text;
         } catch (Exception e) {
             String err = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             log.warn("Protocol task {} failed", taskId, e);
+            clearSubmitContext(taskId);
             update(taskId, TaskStatus.FAILED, null, err, agentId, false, null);
             RemoteAgentEvent error = new RemoteAgentEvent();
             error.setType(RemoteEventType.RUN_ERROR);
@@ -282,9 +324,32 @@ public final class AgentProtocolTaskStore {
             error.setStatus("error");
             eventBus.publish(taskId, error);
             eventBus.complete(taskId);
-            clearSubmitContext(taskId);
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * Builds the agent's runtime context for one run: session/user identity, the caller's {@code
+     * context.attributes} under {@link AgentProtocolConstants#RUNTIME_CONTEXT_ATTRIBUTES_KEY}, and
+     * whatever the registered {@link RuntimeContextCustomizer}s add on top.
+     *
+     * <p>Attributes stay behind a single namespaced key by default so that no caller-supplied name
+     * can shadow a key the framework reads (e.g. {@code agentId}); promoting individual attributes
+     * to their own keys is an explicit opt-in through a customizer.
+     */
+    private RuntimeContext buildRuntimeContext(AgentRequest request) {
+        RuntimeContext.Builder builder = RuntimeContext.builder().sessionId(request.taskId());
+        if (request.userId() != null) {
+            builder.userId(request.userId());
+        }
+        Map<String, Object> attributes = request.attributes();
+        if (!attributes.isEmpty()) {
+            builder.put(AgentProtocolConstants.RUNTIME_CONTEXT_ATTRIBUTES_KEY, attributes);
+        }
+        for (RuntimeContextCustomizer customizer : runtimeContextCustomizers) {
+            customizer.customize(request, builder);
+        }
+        return builder.build();
     }
 
     private void publishStatus(String taskId, String agentId, String status, String error) {
@@ -298,12 +363,7 @@ public final class AgentProtocolTaskStore {
 
     private void markAwaitingConfirm(
             String taskId, String agentId, List<RemotePendingConfirm> pending) {
-        Optional<TaskRecord> prev =
-                workspaceManager.readTaskRecord(
-                        RuntimeContext.empty(),
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        taskId);
+        Optional<TaskRecord> prev = taskRepository.find(taskId);
         TaskRecord r =
                 prev.orElseGet(
                         () ->
@@ -342,17 +402,18 @@ public final class AgentProtocolTaskStore {
 
     private static List<ConfirmResult> toConfirmResults(
             List<RemotePendingConfirm> pending, List<RemoteConfirmDecision> decisions) {
-        Map<String, Boolean> byId = new HashMap<>();
+        Map<String, RemoteConfirmDecision> byId = new HashMap<>();
         if (decisions != null) {
             for (RemoteConfirmDecision d : decisions) {
                 if (d.getToolCallId() != null) {
-                    byId.put(d.getToolCallId(), d.isApproved());
+                    byId.put(d.getToolCallId(), d);
                 }
             }
         }
         List<ConfirmResult> results = new ArrayList<>();
         for (RemotePendingConfirm p : pending) {
-            boolean approved = byId.getOrDefault(p.getToolCallId(), false);
+            RemoteConfirmDecision decision = byId.get(p.getToolCallId());
+            boolean approved = decision != null && decision.isApproved();
             Map<String, Object> input = parseInputQuiet(p.getToolInputJson());
             ToolUseBlock toolCall =
                     ToolUseBlock.builder()
@@ -360,17 +421,18 @@ public final class AgentProtocolTaskStore {
                             .name(p.getToolName())
                             .input(input)
                             .build();
-            results.add(new ConfirmResult(approved, toolCall));
+            results.add(
+                    new ConfirmResult(
+                            approved,
+                            toolCall,
+                            null,
+                            decision == null ? null : decision.getReason()));
         }
         return results;
     }
 
     private void persist(TaskRecord r) {
-        workspaceManager.writeTaskRecord(
-                RuntimeContext.empty(),
-                AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                r);
+        taskRepository.save(r);
     }
 
     private void updateRunning(String taskId, String agentId) {
@@ -385,12 +447,7 @@ public final class AgentProtocolTaskStore {
             String agentId,
             boolean awaitingConfirm,
             List<RemotePendingConfirm> pendingConfirms) {
-        Optional<TaskRecord> prev =
-                workspaceManager.readTaskRecord(
-                        RuntimeContext.empty(),
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        taskId);
+        Optional<TaskRecord> prev = taskRepository.find(taskId);
         TaskRecord r =
                 prev.orElseGet(
                         () ->
@@ -416,12 +473,7 @@ public final class AgentProtocolTaskStore {
     public Map<String, Object> snapshot(String taskId) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("task_id", taskId);
-        Optional<TaskRecord> rec =
-                workspaceManager.readTaskRecord(
-                        RuntimeContext.empty(),
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        taskId);
+        Optional<TaskRecord> rec = taskRepository.find(taskId);
         if (rec.isEmpty()) {
             m.put("status", "error");
             m.put("error", "task not found");
@@ -475,12 +527,7 @@ public final class AgentProtocolTaskStore {
 
         int attempt = 0;
         while (System.currentTimeMillis() < deadline) {
-            Optional<TaskRecord> rec =
-                    workspaceManager.readTaskRecord(
-                            RuntimeContext.empty(),
-                            AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                            AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                            taskId);
+            Optional<TaskRecord> rec = taskRepository.find(taskId);
             if (rec.isEmpty()) {
                 Map<String, Object> err = new LinkedHashMap<>();
                 err.put("status", "error");
@@ -526,12 +573,7 @@ public final class AgentProtocolTaskStore {
         if (f != null) {
             f.cancel(true);
         }
-        Optional<TaskRecord> rec =
-                workspaceManager.readTaskRecord(
-                        RuntimeContext.empty(),
-                        AgentProtocolConstants.PROTOCOL_AGENT_ID,
-                        AgentProtocolConstants.PROTOCOL_SESSION_ID,
-                        taskId);
+        Optional<TaskRecord> rec = taskRepository.find(taskId);
         if (rec.isPresent()) {
             TaskRecord r = rec.get();
             r.setCancelRequested(true);
@@ -604,9 +646,14 @@ public final class AgentProtocolTaskStore {
         }
     }
 
-    private record SubmitContext(String userId, String parentSessionId, String detail) {
+    /**
+     * Parsed protocol fields plus the {@code raw} submission map, which is handed to the {@link
+     * AgentFactory} so custom context keys survive routing on both submit and resume.
+     */
+    private record SubmitContext(
+            String userId, String parentSessionId, String detail, Map<String, Object> raw) {
         static SubmitContext empty() {
-            return new SubmitContext(null, null, "status");
+            return new SubmitContext(null, null, "status", Map.of());
         }
 
         static SubmitContext from(Map<String, Object> raw) {
@@ -619,7 +666,7 @@ public final class AgentProtocolTaskStore {
             if (detail == null || detail.isBlank()) {
                 detail = "status";
             }
-            return new SubmitContext(userId, parentSessionId, detail);
+            return new SubmitContext(userId, parentSessionId, detail, raw);
         }
 
         private static String stringVal(Object v) {

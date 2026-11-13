@@ -1,8 +1,13 @@
-# AG-UI
+---
+title: AG-UI
+zh_link: /v2/zh/integration/protocol/agui
+---
 
 ## Compatibility Notes
 
 `agentscope-extensions-agui` converts AgentScope v2 `AgentEvent` streams into [AG-UI Protocol](https://github.com/ag-ui-protocol/ag-ui) events so front-end UIs can render an agent run in real time, including text, reasoning, tool calls, state, custom events, token usage, and HITL interrupts.
+
+`RUN_ERROR` and `RUN_FINISHED` are mutually exclusive terminal events. Set `emitRunFinishedAfterError=true` only if you still need the legacy `RUN_ERROR` + `RUN_FINISHED` sequence.
 
 `AguiMessage.content` is represented as typed message content. For text-only code paths, use `getTextContent()`.
 
@@ -59,7 +64,7 @@ AguiAgentAdapter adapter = new AguiAgentAdapter(agent, config);
 Flux<AguiEvent> events = adapter.run(runAgentInput);
 ```
 
-The front end provides `RunAgentInput`, including `threadId`, `runId`, `messages`, `tools`, `state`等. The adapter converts AG-UI messages to AgentScope `Msg` objects, invokes v2 `streamEvents(...)`, and converts each `AgentEvent` to AG-UI events.
+The front end provides `RunAgentInput`, including `threadId`, `runId`, `messages`, `tools`, `state`, and related fields. The adapter converts AG-UI messages to AgentScope `Msg` objects, invokes v2 `streamEvents(...)`, and converts each `AgentEvent` to AG-UI events.
 
 ## Event Mapping
 
@@ -77,7 +82,7 @@ The v2 path consumes `AgentEvent`. Built-in converters handle semantic mapping, 
 | token usage (`emitTokenUsage=true`)    | `CUSTOM`, `name=token_usage` |
 | Unmapped `AgentEvent`                  | `RAW`, with official `event` and `source` fields |
 
-Normal `RUN_STARTED` and `RUN_FINISHED` events are driven by upstream `AgentStartEvent` and `AgentEndEvent`. If a normal stream completes without an upstream `AgentEndEvent`, the adapter does not synthesize `RUN_FINISHED`. On errors, the adapter emits a `RUN_ERROR` with a `timestamp`, then emits a fallback `RUN_FINISHED`.
+Normal `RUN_STARTED` and `RUN_FINISHED` events are driven by upstream `AgentStartEvent` and `AgentEndEvent`. If a normal stream completes without an upstream `AgentEndEvent`, the adapter does not synthesize `RUN_FINISHED`. On errors, the adapter emits a `RUN_ERROR` with a `timestamp`. `RUN_ERROR` and `RUN_FINISHED` are mutually exclusive terminal events. Set `emitRunFinishedAfterError=true` (or Spring Boot `agentscope.agui.emit-run-finished-after-error=true`) only for legacy clients that still expect a finish event after an error.
 
 ## Subagent events
 
@@ -216,8 +221,15 @@ agentscope:
     emit-tool-call-args: true
     emit-token-usage: false
     enable-reasoning: false
+    emit-run-finished-after-error: false
     server-side-memory: false
+    interrupt-on-disconnect: true
 ```
+
+`interrupt-on-disconnect` controls whether an Agent run is interrupted when the MVC/WebFlux SSE
+connection is closed, times out, or fails while sending an event. It defaults to `true` for
+backward compatibility. Set it to `false` to let the Agent continue running after the client
+disconnects; events produced while the connection is closed are not replayed by the starter.
 
 You can extend the default chain with beans:
 
@@ -242,19 +254,24 @@ AguiRuntimeContextResolver runtimeContextResolver() {
 
 ## Frontend Tools And Merge Mode
 
-An AG-UI front end can pass tool schemas through `RunAgentInput.tools`. The adapter injects those tools into the agent toolkit at the start of one run and cleans them up after the run completes or is cancelled.
+An AG-UI front end can pass tool schemas through `RunAgentInput.tools`. The adapter converts them into a run-scoped `ToolRequestConfig` carried by RuntimeContext. It never mutates the agent toolkit, so completion and cancellation require no registry restoration.
 
 | `ToolMergeMode` | Behavior |
 | --- | --- |
-| `FRONTEND_ONLY` | Use only frontend-provided tools and temporarily hide existing agent tools |
+| `EXTERNAL_ONLY` | Use only frontend-provided tools and temporarily hide existing agent tools |
 | `AGENT_ONLY` | Ignore frontend-provided tools and use only the agent toolkit |
-| `MERGE_FRONTEND_PRIORITY` | Merge both sides; frontend tools win on name conflicts |
+| `MERGE_EXTERNAL_PRIORITY` | Merge both sides; frontend tools win on name conflicts |
 
-The default is `MERGE_FRONTEND_PRIORITY`. Injection is run scoped and does not permanently mutate the agent toolkit.
+The default is `MERGE_EXTERNAL_PRIORITY`. Import the enum from `io.agentscope.core.tool.ToolMergeMode`. `EXTERNAL_ONLY` exposes no tools when the external list is empty, regardless of the Toolkit deletion policy: it controls request visibility only.
 
 ## HITL Interrupts
 
-When the model requests a tool and suspension is needed for user approval or external execution, the AG-UI adapter converts the suspended result into a `RUN_FINISHED` interrupt outcome:
+When a run pauses for a tool decision, the AG-UI adapter emits the official interrupt outcome on `RUN_FINISHED`. AgentScope Java has two built-in tool-call interrupt paths:
+
+- **Tool suspension / external execution**: a suspended `ToolResultBlock` becomes a `tool_call` interrupt and resumes as a `ToolResultBlock`.
+- **Permission confirmation**: `RequireUserConfirmEvent` becomes a `tool_call` interrupt with AgentScope metadata and resumes as a `ConfirmResult`.
+
+Both use the official AG-UI `reason: "tool_call"` because the interrupt is bound to a specific `toolCallId`. Do not use `reason: "confirmation"` for these tool-bound approvals.
 
 ```json
 {
@@ -263,11 +280,31 @@ When the model requests a tool and suspension is needed for user approval or ext
     "type": "interrupt",
     "interrupts": [
       {
+        "id": "reply-1:call-1",
         "reason": "tool_call",
         "toolCallId": "call-1",
         "message": "Need approval before running this tool",
+        "responseSchema": {
+          "type": "object",
+          "properties": {
+            "approved": { "type": "boolean" },
+            "editedArgs": {
+              "type": "object",
+              "description": "Full replacement of the tool args. Not merged."
+            },
+            "reason": {
+              "type": "string",
+              "description": "Optional explanation supplied when the tool call is denied."
+            }
+          },
+          "required": ["approved"]
+        },
         "metadata": {
-          "toolName": "request_approval"
+          "agentscope.interruptKind": "permission_confirm",
+          "toolName": "request_approval",
+          "toolInput": { "path": "/tmp/report.txt" },
+          "toolContent": "{\"path\":\"/tmp/report.txt\"}",
+          "replyId": "reply-1"
         }
       }
     ]
@@ -287,7 +324,10 @@ The front end can show an approval or external-execution UI. After the user acts
       "interruptId": "reply-1:call-1",
       "status": "resolved",
       "payload": {
-        "approved": true
+        "approved": true,
+        "editedArgs": {
+          "path": "/tmp/reviewed-report.txt"
+        }
       }
     }
   ]
@@ -296,13 +336,15 @@ The front end can show an approval or external-execution UI. After the user acts
 
 `status` supports the official `resolved` and `cancelled` values. For the common approval case where a user rejects a tool request, prefer `resolved` and express the business decision in `payload`, for example `{ "approved": false }`; use `cancelled` when the interrupt itself is cancelled.
 
-AgentScope Java bridges tool-call `resume[]` entries to the `ToolResultBlock` messages required by core so the suspended tool call can continue. Through the Spring `AguiRequestProcessor` entry point, the processor records the latest `RUN_FINISHED.outcome.interrupts[]` and resolves the real `toolCallId` by `interruptId`.
+For permission confirmations, `payload.approved` must be the boolean `true` to approve the tool. Any missing, non-boolean, or `false` value is treated as denial. `payload.editedArgs`, when present, must be a JSON object and is a **full replacement** of the original tool arguments, not a partial merge. AgentScope Java rebuilds both the `ToolUseBlock.input` and raw JSON `ToolUseBlock.content` from `editedArgs`, so the approved tool executes the edited arguments.
 
-The built-in resume path currently covers tool-call interrupts generated by the AG-UI adapter. Custom interrupts with different semantics usually need a custom `AgentEventConverter` / `AguiEventEnricher` or request-processing layer to interpret their `payload`.
+`payload.reason` is an optional string. On denial it becomes `ConfirmResult.reason` and is used as the DENIED tool-result text; when it is missing or blank, AgentScope keeps the default `Permission denied by user` message.
+
+The front end does not need to echo `metadata` in `resume[]`; it only sends `interruptId`, `status`, and `payload`. Through the Spring `AguiRequestProcessor` entry point, AgentScope Java records the latest `RUN_FINISHED.outcome.interrupts[]` server-side, validates that the next `resume[]` covers all open interrupts, and passes the originating interrupts into the adapter for conversion.
 
 ## Example Project
 
-See the complete example at [agentscope-examples/agui](https://github.com/agentscope-ai/agentscope-java/tree/main/agentscope-examples/agui):
+See the complete example at [agentscope-examples/agui](https://github.com/agentscope-ai/agentscope-java/tree/v2.0.4/agentscope-examples/agui):
 
 ```bash
 export DASHSCOPE_API_KEY=your-key

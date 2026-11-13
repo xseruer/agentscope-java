@@ -20,11 +20,14 @@ import io.agentscope.claw2.runtime.config.ChannelConfigEntry;
 import io.agentscope.claw2.web.scaffold.WorkspaceScaffolder;
 import io.agentscope.claw2.web.toolbus.ToolEventBus;
 import io.agentscope.claw2.web.toolbus.ToolNotificationMiddleware;
+import io.agentscope.core.journal.ThreadJournalStore;
 import io.agentscope.core.model.Model;
 import io.agentscope.extensions.model.dashscope.DashScopeChatModel;
+import io.agentscope.harness.agent.filesystem.local.LocalFilesystem;
 import io.agentscope.harness.agent.gateway.channel.ChannelConfig;
 import io.agentscope.harness.agent.gateway.channel.DmScope;
 import io.agentscope.harness.agent.gateway.channel.chatui.ChatUiChannel;
+import io.agentscope.harness.agent.journal.WorkspaceThreadJournalStore;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -82,6 +85,10 @@ public class BuilderConfig {
                     + " concisely.}")
     private String agentSysPrompt;
 
+    /** Optional shared native session-log root; empty uses each agent's workspace backend. */
+    @Value("${claw.session-log.root:}")
+    private String sessionLogRoot;
+
     // -----------------------------------------------------------------
     //  Model bean — only created when an api-key is set AND no other
     //  Model bean is already present in the context.
@@ -99,13 +106,22 @@ public class BuilderConfig {
                 .build();
     }
 
+    @Bean
+    @ConditionalOnExpression("'${claw.session-log.root:}' != ''")
+    public ThreadJournalStore pawSessionLogStore() {
+        return new WorkspaceThreadJournalStore(new LocalFilesystem(resolvePath(sessionLogRoot)));
+    }
+
     // -----------------------------------------------------------------
     //  Core bootstrap — model injected as method parameter to avoid the
     //  circular dependency that would occur with field-level @Autowired.
     // -----------------------------------------------------------------
 
     @Bean
-    public ClawBootstrap builderBootstrap(Optional<Model> modelOpt, ToolEventBus toolEventBus)
+    public ClawBootstrap builderBootstrap(
+            Optional<Model> modelOpt,
+            ToolEventBus toolEventBus,
+            Optional<ThreadJournalStore> threadJournalStore)
             throws IOException {
         Path home = resolveClawHome();
         ensureAgentscopeConfig(home);
@@ -130,6 +146,9 @@ public class BuilderConfig {
         }
 
         builder.configureAllAgents(b -> b.middleware(new ToolNotificationMiddleware(toolEventBus)));
+
+        threadJournalStore.ifPresent(
+                store -> builder.configureAllAgents(b -> b.threadJournalStore(store)));
 
         ClawBootstrap bootstrap = builder.build();
 
@@ -184,10 +203,15 @@ public class BuilderConfig {
 
     private Path resolveClawHome() {
         String raw = clawHome != null && !clawHome.isBlank() ? clawHome : "~/.agentscope/claw";
-        if (raw.startsWith("~")) {
-            raw = System.getProperty("user.home") + raw.substring(1);
+        return resolvePath(raw);
+    }
+
+    private static Path resolvePath(String raw) {
+        String expanded = raw;
+        if (expanded.startsWith("~")) {
+            expanded = System.getProperty("user.home") + expanded.substring(1);
         }
-        return Paths.get(raw).toAbsolutePath().normalize();
+        return Paths.get(expanded).toAbsolutePath().normalize();
     }
 
     /**

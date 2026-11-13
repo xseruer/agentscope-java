@@ -28,6 +28,8 @@ import io.agentscope.harness.agent.sandbox.SandboxException;
 import io.agentscope.harness.agent.sandbox.SandboxState;
 import io.agentscope.harness.agent.sandbox.WorkspaceSpec;
 import io.agentscope.harness.agent.sandbox.json.HarnessSandboxJacksonModule;
+import io.agentscope.harness.agent.sandbox.snapshot.RemoteSandboxSnapshot;
+import io.agentscope.harness.agent.sandbox.snapshot.RemoteSnapshotSpec;
 import io.agentscope.harness.agent.sandbox.snapshot.SandboxSnapshotSpec;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.KubernetesClientBuilder;
@@ -121,6 +123,7 @@ public class KubernetesSandboxClient
                             CreateSandboxOptions.builder(merged.getWarmPoolName())
                                     .namespace(merged.getNamespace())
                                     .claimName(claimName)
+                                    .env(merged.getClaimEnv())
                                     .sandboxReadyTimeoutSeconds(
                                             merged.getSandboxReadyTimeoutSeconds())
                                     .build());
@@ -188,6 +191,21 @@ public class KubernetesSandboxClient
         }
     }
 
+    /**
+     * Restores the runtime storage client omitted from remote snapshot JSON while keeping the
+     * persisted archive id. This is needed even when the existing Kubernetes claim resumes
+     * successfully and the manager does not fall back to creating a new sandbox.
+     */
+    @Override
+    public SandboxState deserializeState(String json, SandboxSnapshotSpec snapshotSpec) {
+        SandboxState state = deserializeState(json);
+        if (snapshotSpec instanceof RemoteSnapshotSpec remoteSpec
+                && state.getSnapshot() instanceof RemoteSandboxSnapshot snapshot) {
+            state.setSnapshot(new RemoteSandboxSnapshot(remoteSpec.getClient(), snapshot.getId()));
+        }
+        return state;
+    }
+
     private SandboxClient buildSdkClient(KubernetesSandboxClientOptions opts) {
         KubernetesClient kc = resolveClient(opts);
         SandboxConnectionConfig connectionConfig = toConnectionConfig(opts);
@@ -234,6 +252,9 @@ public class KubernetesSandboxClient
             return copy(base);
         }
         KubernetesSandboxClientOptions o = copy(base);
+        if (callOptions.getClaimEnv() != null) {
+            o.setClaimEnv(callOptions.getClaimEnv());
+        }
         if (callOptions.getKubernetesClient() != null) {
             o.setKubernetesClient(callOptions.getKubernetesClient());
         }
@@ -276,6 +297,7 @@ public class KubernetesSandboxClient
         o.setKubernetesConfig(src.getKubernetesConfig());
         o.setNamespace(src.getNamespace());
         o.setWarmPoolName(src.getWarmPoolName());
+        o.setClaimEnv(src.getClaimEnv());
         o.setWorkspaceRoot(src.getWorkspaceRoot());
         o.setFileApiBaseDir(src.getFileApiBaseDir());
         o.setApiUrl(src.getApiUrl());

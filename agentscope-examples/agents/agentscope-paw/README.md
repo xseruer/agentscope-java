@@ -15,10 +15,8 @@ ping it from a DM or @-mention it on an issue instead of opening yet another
 browser tab.
 
 paw deliberately doesn't try to be more than that. There's no login, no
-multi-tenant isolation, no Docker sandbox, no horizontal scaling. If you need
-any of those — host paw-style agents for a team, or run untrusted code in
-isolation — the sister projects [agentscope-builder](../agentscope-builder/)
-and [agentscope-dataagent](../agentscope-dataagent/) cover those use cases.
+multi-tenant isolation, no Docker sandbox, no horizontal scaling. For an
+assistant with sandbox isolation, see [agentscope-dataagent](../agentscope-dataagent/).
 
 ### At a glance
 
@@ -576,6 +574,21 @@ Recognised properties (all under `paw.*`, with matching `PAW_*` env vars):
 
 If you provide your own `Model` Spring bean (for example by importing another
 `@Configuration`), the auto-wired DashScope model is skipped.
+
+## Native session history
+
+Harness records the native Thread journal in the Workspace Filesystem's private partition. Paw history pages read these records through `threadTranscript()`. Read native files through the ThreadJournal API, not a JSONL parser.
+
+```bash
+# Optional shared native-log root; unset uses each agent's Workspace backend.
+export CLAW_SESSION_LOG_ROOT=/data/paw-session-history
+```
+
+| Property | Environment | Default |
+| --- | --- | --- |
+| `claw.session-log.root` | `CLAW_SESSION_LOG_ROOT` | Empty: Workspace backend |
+
+A custom `ThreadJournalStore` Spring Bean applies to built-in and dynamic agents. See [session logs and recovery](../../../docs/dev/en/docs/harness/session-log.md) for storage, restoration and SSE integration.
 
 ## What this fork is _not_
 
