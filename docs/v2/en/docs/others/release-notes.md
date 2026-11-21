@@ -1,9 +1,224 @@
 ---
-title: "Release Notes"
-description: "Per-version change records for AgentScope Java"
+title: Release Notes
+description: Per-version change records for AgentScope Java
+zh_link: /v2/zh/docs/others/release-notes
 ---
 
-This page tracks per-version changes for AgentScope Java 2.0. For the overall migration guide from 1.x, see the [V1 Migration Guide](../change-log.md).
+This page tracks per-version changes for AgentScope Java 2.0. For the overall migration guide from 1.x, see the [V1 Migration Guide](/v2/en/docs/change-log).
+
+---
+
+## Unreleased
+
+### Harness workspace queue compatibility
+
+The filesystem-backed `WorkspaceMessageBus` queue will publish `{id}.payload` and `{id}.ready` instead of a single `{id}.json` ([#3281](https://github.com/agentscope-ai/agentscope-java/pull/3281)). Older drain-side instances scan only `.json` and cannot see new entries. On a shared backend, upgrade all drain-side instances before new writers publish, or pause queue traffic during the rollout.
+
+---
+
+## 2.0.4
+
+> Source: `v2.0.4` release tag.
+
+AgentScope Java 2.0.4 adds OpenAI Responses API support, a redesigned AgentScope Service, new channel and storage integrations, and stronger isolation for concurrent agent runs, tools, and skills.
+
+### Added
+
+**Core / Models**
+
+- Add the OpenAI Responses API module ([#3078](https://github.com/agentscope-ai/agentscope-java/pull/3078)).
+- Support `returnDirect` tool results to short-circuit the reasoning loop ([#2891](https://github.com/agentscope-ai/agentscope-java/pull/2891)).
+- Expose detailed chat usage token metrics and model-fallback failover listeners ([#3215](https://github.com/agentscope-ai/agentscope-java/pull/3215), [#3145](https://github.com/agentscope-ai/agentscope-java/pull/3145)).
+- Support Anthropic bearer token authentication ([#3038](https://github.com/agentscope-ai/agentscope-java/pull/3038)).
+- Add a type-safe Jev System One client, Spring Boot starter, and example middlewares ([#3240](https://github.com/agentscope-ai/agentscope-java/pull/3240)).
+
+**Harness / Tools / Storage**
+
+- Add per-run execution control with `AgentRun` / `RunControl` and explicit runtime context propagation ([#3279](https://github.com/agentscope-ai/agentscope-java/pull/3279)).
+- Add request-scoped tool configuration and isolate tool visibility, streaming callbacks, and session skill resources ([#3283](https://github.com/agentscope-ai/agentscope-java/pull/3283)).
+- Add opt-in `sharedLocalWorkspace` to filesystem specs ([#3247](https://github.com/agentscope-ai/agentscope-java/pull/3247)).
+- Allow disabling built-in web tools and injecting an HTTP client into them ([#3075](https://github.com/agentscope-ai/agentscope-java/pull/3075), [#3103](https://github.com/agentscope-ai/agentscope-java/pull/3103)).
+- Add configurable MCP metadata propagation per server and tool ([#3255](https://github.com/agentscope-ai/agentscope-java/pull/3255)).
+- Add MongoDB storage extension ([#2698](https://github.com/agentscope-ai/agentscope-java/pull/2698)).
+- Automatically prune old E2B native snapshots per sandbox ([#2555](https://github.com/agentscope-ai/agentscope-java/pull/2555)).
+
+**Service / Channels**
+
+- Introduce the redesigned AgentScope Service implementation ([#3080](https://github.com/agentscope-ai/agentscope-java/pull/3080)).
+- Add Personal Weixin iLink channel integration ([#3184](https://github.com/agentscope-ai/agentscope-java/pull/3184)).
+- Add DingTalk HTTP callback receive mode alongside Stream mode ([#3177](https://github.com/agentscope-ai/agentscope-java/pull/3177)).
+- Add pluggable channel access-token storage and inbound-event deduplication, with idle eviction for bot-loop guards ([#3182](https://github.com/agentscope-ai/agentscope-java/pull/3182), [#3175](https://github.com/agentscope-ai/agentscope-java/pull/3175)).
+- Expose inbound channel media messages as neutral metadata ([#3180](https://github.com/agentscope-ai/agentscope-java/pull/3180)).
+
+### Changed
+
+- Remove the unused message role parameter ([#3045](https://github.com/agentscope-ai/agentscope-java/pull/3045)).
+- Pass Gemini tool parameter schemas directly as native JSON Schema ([#3051](https://github.com/agentscope-ai/agentscope-java/pull/3051)).
+- Derive `Version.VERSION` from the Maven project version ([#3087](https://github.com/agentscope-ai/agentscope-java/pull/3087)).
+- Migrate the documentation site to Mintlify while preserving legacy URLs and restoring hosted language switching ([#3081](https://github.com/agentscope-ai/agentscope-java/pull/3081), [#3082](https://github.com/agentscope-ai/agentscope-java/pull/3082), [#3276](https://github.com/agentscope-ai/agentscope-java/pull/3276)).
+
+### Fixed
+
+**Core / State / Concurrency**
+
+- Isolate concurrent invocation contexts and cancellation of individual running or queued executions ([#3279](https://github.com/agentscope-ai/agentscope-java/pull/3279)); prevent cross-session tool and skill interference ([#3283](https://github.com/agentscope-ai/agentscope-java/pull/3283)).
+- Fix version-0 state migration CAS conflicts, atomically return JDBC unconditional-write versions, and cache versions after unconditional writes ([#3165](https://github.com/agentscope-ai/agentscope-java/pull/3165), [#3220](https://github.com/agentscope-ai/agentscope-java/pull/3220), [#3236](https://github.com/agentscope-ai/agentscope-java/pull/3236)).
+- Evict slot versions with the state cache, avoid deserializing the `State` marker interface, and persist state after empty agent results ([#3074](https://github.com/agentscope-ai/agentscope-java/pull/3074), [#3048](https://github.com/agentscope-ai/agentscope-java/pull/3048), [#3049](https://github.com/agentscope-ai/agentscope-java/pull/3049)).
+- Preserve failed summary termination state and handle synchronous model-fallback failures ([#2757](https://github.com/agentscope-ai/agentscope-java/pull/2757), [#3149](https://github.com/agentscope-ai/agentscope-java/pull/3149)).
+- Emit tool-result events for denied HITL calls and support custom denial reasons ([#3104](https://github.com/agentscope-ai/agentscope-java/pull/3104), [#2546](https://github.com/agentscope-ai/agentscope-java/pull/2546)).
+- Make JSON Schema generation thread-safe ([#2796](https://github.com/agentscope-ai/agentscope-java/pull/2796)).
+
+**Model Providers**
+
+- Default plaintext HTTP requests to HTTP/1.1 to prevent h2c upgrades from losing POST bodies with vLLM / uvicorn ([#3214](https://github.com/agentscope-ai/agentscope-java/pull/3214)).
+- Preserve reasoning details from all streaming chunks and thought signatures across JSON persistence round-trips; remove redundant OpenAI tool metadata ([#3128](https://github.com/agentscope-ai/agentscope-java/pull/3128), [#2910](https://github.com/agentscope-ai/agentscope-java/pull/2910), [#2914](https://github.com/agentscope-ai/agentscope-java/pull/2914)).
+- Move cache control to content blocks ([#2878](https://github.com/agentscope-ai/agentscope-java/pull/2878)).
+- Decouple DashScope streaming from thinking mode, allow custom multimodal endpoint detection, and offload blocking embedding SDK calls ([#3137](https://github.com/agentscope-ai/agentscope-java/pull/3137), [#3163](https://github.com/agentscope-ai/agentscope-java/pull/3163), [#3265](https://github.com/agentscope-ai/agentscope-java/pull/3265)).
+- Correct Gemini token usage accounting ([#3034](https://github.com/agentscope-ai/agentscope-java/pull/3034)).
+- Serialize Ollama tool-result names as `tool_name` and expose thinking output as `ThinkingBlock` ([#3093](https://github.com/agentscope-ai/agentscope-java/pull/3093), [#3146](https://github.com/agentscope-ai/agentscope-java/pull/3146)).
+
+**Harness / Sandbox / Integrations**
+
+- Preserve non-UTF-8 file uploads and expose session workspace paths in prompts ([#2456](https://github.com/agentscope-ai/agentscope-java/pull/2456), [#3020](https://github.com/agentscope-ai/agentscope-java/pull/3020)).
+- Rebind Kubernetes remote snapshots on state resume and preserve wrapping newlines in commands ([#3025](https://github.com/agentscope-ai/agentscope-java/pull/3025), [#3204](https://github.com/agentscope-ai/agentscope-java/pull/3204)).
+- Improve Docker sandbox native file transfer and reject truncated downloads ([#2923](https://github.com/agentscope-ai/agentscope-java/pull/2923)).
+- Keep MCP connections open for AgentRun sandboxes that are not owned by the caller; preserve image URLs in MCP tool results ([#2302](https://github.com/agentscope-ai/agentscope-java/pull/2302), [#3053](https://github.com/agentscope-ai/agentscope-java/pull/3053)).
+- Allow path separators in JDBC sandbox-shaped slot IDs ([#3233](https://github.com/agentscope-ai/agentscope-java/pull/3233)).
+- Preserve AG-UI tool results after permission resume, assign unique IDs to discontinuous text segments, and clear active-run markers before terminal signals ([#3100](https://github.com/agentscope-ai/agentscope-java/pull/3100), [#3010](https://github.com/agentscope-ai/agentscope-java/pull/3010), [#3109](https://github.com/agentscope-ai/agentscope-java/pull/3109)).
+- Propagate WeCom send rejections as stream errors ([#3173](https://github.com/agentscope-ai/agentscope-java/pull/3173)).
+- Use modular core and AG-UI dependencies in Spring Boot starters ([#3156](https://github.com/agentscope-ai/agentscope-java/pull/3156)).
+- Normalize Milvus L2 retrieval scores and escape WordReader Markdown table cells ([#3070](https://github.com/agentscope-ai/agentscope-java/pull/3070), [#3169](https://github.com/agentscope-ai/agentscope-java/pull/3169)).
+- Make E2B exec timeouts deterministic: disable the idle read timeout, kill the remote process via `Connect-Timeout-Ms`, treat `timeoutSeconds = 0` as no deadline, and rethrow external cancellations instead of reporting a timeout ([#2976](https://github.com/agentscope-ai/agentscope-java/pull/2976)).
+- Stop `ExecTimeoutException` messages from echoing the command text, for both E2B and Docker sandboxes ([#2976](https://github.com/agentscope-ai/agentscope-java/pull/2976)).
+
+### Documentation
+
+- Add bilingual Agent Harness building guides and rebuild AgentScope Service product guides ([#3139](https://github.com/agentscope-ai/agentscope-java/pull/3139), [#3136](https://github.com/agentscope-ai/agentscope-java/pull/3136)).
+- Document Jev structured decision integration and correct the documented `CompactionConfig.keepTokens` default ([#3274](https://github.com/agentscope-ai/agentscope-java/pull/3274), [#3144](https://github.com/agentscope-ai/agentscope-java/pull/3144)).
+
+**Full changelog:** [v2.0.3...v2.0.4](https://github.com/agentscope-ai/agentscope-java/compare/v2.0.3...v2.0.4)
+
+---
+
+## 2.0.1
+
+> Released: 2026-08-05
+
+AgentScope Java 2.0.1 is the first maintenance release after 2.0.0 GA. It expands the model-provider ecosystem, hardens Harness subagent / HITL / permission behavior, and fixes a set of production-critical issues.
+
+**Quick links:** [Quickstart](/v2/en/docs/quickstart) | [V1 Migration Guide](/v2/en/docs/change-log) | [Going to Production](/v2/en/docs/others/going-to-production)
+
+### Added
+
+**Core / Agent**
+
+- Middleware execution ordering via `MiddlewareBase.order()` (higher values wrap outer); `ReActAgent.Builder.build()` stably sorts descending after all registrations ([#2532](https://github.com/agentscope-ai/agentscope-java/pull/2532), [#2449](https://github.com/agentscope-ai/agentscope-java/issues/2449))
+- Session context clear API on `ReActAgent` / `HarnessAgent` to clear model-visible conversation context without creating a new session ([#2499](https://github.com/agentscope-ai/agentscope-java/pull/2499), [#2496](https://github.com/agentscope-ai/agentscope-java/issues/2496))
+- Expose `ReActAgent` state-cache cleanup APIs for long-lived instances ([#2572](https://github.com/agentscope-ai/agentscope-java/pull/2572))
+- Emit `UserConfirmResultEvent` when resuming permission HITL, correlatable with the prior `RequireUserConfirmEvent` via `replyId` ([#2511](https://github.com/agentscope-ai/agentscope-java/pull/2511))
+- Anthropic: support configuring `disable_parallel_tool_use` ([#2257](https://github.com/agentscope-ai/agentscope-java/pull/2257))
+
+**Model Providers**
+
+- Add OpenAI-compatible extension package as a shared base for third-party compatible vendors ([#2208](https://github.com/agentscope-ai/agentscope-java/pull/2208))
+- Add DeepSeek as a first-class model provider (`deepseek:<model>`, `DEEPSEEK_API_KEY`) ([#2307](https://github.com/agentscope-ai/agentscope-java/pull/2307), [#2211](https://github.com/agentscope-ai/agentscope-java/issues/2211))
+- Add GLM (Zhipu AI) provider and dedicated formatters ([#2316](https://github.com/agentscope-ai/agentscope-java/pull/2316))
+- Add Kimi (Moonshot AI) provider and dedicated formatters ([#2320](https://github.com/agentscope-ai/agentscope-java/pull/2320), [#2213](https://github.com/agentscope-ai/agentscope-java/issues/2213))
+- Add MiniMax OpenAI-compatible provider ([#2299](https://github.com/agentscope-ai/agentscope-java/pull/2299))
+
+**Harness / Tools**
+
+- Remote subagent event streaming and HITL resume ([#2559](https://github.com/agentscope-ai/agentscope-java/pull/2559))
+- Wait for async tool results by `taskId` ([#2529](https://github.com/agentscope-ai/agentscope-java/pull/2529))
+- Default workspace via `AGENTSCOPE_WORKSPACE` env var for image packaging ([#2310](https://github.com/agentscope-ai/agentscope-java/pull/2310))
+
+**AG-UI**
+
+- Upgrade AG-UI module event mechanism ([#2306](https://github.com/agentscope-ai/agentscope-java/pull/2306), [#2202](https://github.com/agentscope-ai/agentscope-java/issues/2202))
+- Introduce typed `MessageContent` / `InputContent` for multimodal AG-UI messages ([#2518](https://github.com/agentscope-ai/agentscope-java/pull/2518), [#551](https://github.com/agentscope-ai/agentscope-java/issues/551))
+
+**Spring Boot Starters**
+
+- Add Ollama Spring Boot Starter ([#2176](https://github.com/agentscope-ai/agentscope-java/pull/2176), [#2172](https://github.com/agentscope-ai/agentscope-java/issues/2172))
+
+### Refactored
+
+- Change Toolkit default execution mode to parallel and improve related docs ([#2558](https://github.com/agentscope-ai/agentscope-java/pull/2558), follow-up of [#2529](https://github.com/agentscope-ai/agentscope-java/pull/2529))
+- Abstract session metadata storage to decouple builders from concrete store implementations ([#2258](https://github.com/agentscope-ai/agentscope-java/pull/2258), [#2068](https://github.com/agentscope-ai/agentscope-java/issues/2068))
+- Rebase Kubernetes sandbox store on [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) CRDs / controllers, with the cluster owning sandbox lifecycle and warm pools ([#2308](https://github.com/agentscope-ai/agentscope-java/pull/2308))
+
+### Fixed
+
+**Core / Agent**
+
+- Prevent pending recovery from consuming HITL approvals ([#2109](https://github.com/agentscope-ai/agentscope-java/pull/2109), [#2534](https://github.com/agentscope-ai/agentscope-java/issues/2534))
+- Apply transformed `onModelCall` text deltas to the final message so native structured-output parsing does not see stale text ([#2469](https://github.com/agentscope-ai/agentscope-java/pull/2469), [#2385](https://github.com/agentscope-ai/agentscope-java/issues/2385))
+- Repair null streaming tool args from complete raw JSON ([#2451](https://github.com/agentscope-ai/agentscope-java/pull/2451), [#768](https://github.com/agentscope-ai/agentscope-java/issues/768))
+- Unbind state-saver on `ReActAgent.close()` to prevent graceful-shutdown registry growth / OOM ([#2322](https://github.com/agentscope-ai/agentscope-java/pull/2322), [#2321](https://github.com/agentscope-ai/agentscope-java/issues/2321))
+- Unbind `ShutdownStateSaver` on `ReActAgent.close()` to fix a memory leak ([#2384](https://github.com/agentscope-ai/agentscope-java/pull/2384))
+- Mark user interrupts with interrupted reason ([#2260](https://github.com/agentscope-ai/agentscope-java/pull/2260))
+- Handle malformed Unicode when writing agent state files (`UnmappableCharacterException`) ([#2255](https://github.com/agentscope-ai/agentscope-java/pull/2255), [#2204](https://github.com/agentscope-ai/agentscope-java/issues/2204))
+- Forward reasoning middleware events (e.g. `InboxMiddleware` `HintBlockEvent`) to `streamEvents()` ([#2179](https://github.com/agentscope-ai/agentscope-java/pull/2179), [#2160](https://github.com/agentscope-ai/agentscope-java/issues/2160))
+- Mark `ToolResultBlock.error` as a structured error ([#2174](https://github.com/agentscope-ai/agentscope-java/pull/2174), [#2157](https://github.com/agentscope-ai/agentscope-java/issues/2157), [#2111](https://github.com/agentscope-ai/agentscope-java/issues/2111))
+
+**Model Providers**
+
+- DashScope: route `qwen3.8-max` to the multimodal endpoint ([#2553](https://github.com/agentscope-ai/agentscope-java/pull/2553))
+- DashScope: preserve SSE error response body so callers can read `request_id` ([#2278](https://github.com/agentscope-ai/agentscope-java/pull/2278), [#2197](https://github.com/agentscope-ai/agentscope-java/issues/2197))
+- OpenAI: wrap streaming branch in `Flux.defer` so retries re-issue HTTP requests ([#2079](https://github.com/agentscope-ai/agentscope-java/pull/2079))
+- OpenAI: terminate stream on `[DONE]` sentinel ([#2104](https://github.com/agentscope-ai/agentscope-java/pull/2104))
+- OpenAI: drop non-chunk summary event messages to avoid content duplication ([#2367](https://github.com/agentscope-ai/agentscope-java/pull/2367))
+- OpenAI: sanitize `name` field in `OpenAIMessageConverter` ([#2346](https://github.com/agentscope-ai/agentscope-java/pull/2346))
+- OpenAI AutoConfiguration: make api-key optional ([#2175](https://github.com/agentscope-ai/agentscope-java/pull/2175))
+- DeepSeek formatter: preserve `system` role ([#2189](https://github.com/agentscope-ai/agentscope-java/pull/2189), [#2168](https://github.com/agentscope-ai/agentscope-java/issues/2168))
+- Ollama: honor `stream` flag in `OllamaChatModel` ([#2415](https://github.com/agentscope-ai/agentscope-java/pull/2415))
+- Anthropic: map `ToolChoice.None` to disable tools (previously incorrectly forced tool use) ([#2232](https://github.com/agentscope-ai/agentscope-java/pull/2232), [#2221](https://github.com/agentscope-ai/agentscope-java/issues/2221))
+- Model provider optimizations and compatibility tweaks ([#2474](https://github.com/agentscope-ai/agentscope-java/pull/2474))
+
+**Harness / Tools / Sandbox**
+
+- Stamp `taskId` on remote subagent forwarded events ([#2575](https://github.com/agentscope-ai/agentscope-java/pull/2575))
+- Gate memory prompt guidance on disable flags ([#2565](https://github.com/agentscope-ai/agentscope-java/pull/2565))
+- Emit subagent end before parent completion to avoid dropped events ([#2544](https://github.com/agentscope-ai/agentscope-java/pull/2544))
+- Close subagent event stream when the parent is cancelled ([#2481](https://github.com/agentscope-ai/agentscope-java/pull/2481), [#2480](https://github.com/agentscope-ai/agentscope-java/issues/2480))
+- Enforce parent DENY rules for spawned subagents ([#2477](https://github.com/agentscope-ai/agentscope-java/pull/2477))
+- Preserve `RuntimeContext` during skill promotion ([#2465](https://github.com/agentscope-ai/agentscope-java/pull/2465))
+- Enforce Plan Mode for subagents ([#2377](https://github.com/agentscope-ai/agentscope-java/pull/2377))
+- Reject workspace path traversal (e.g. `../`) ([#2358](https://github.com/agentscope-ai/agentscope-java/pull/2358))
+- Support Windows local shell execution (working-directory commands and charset decoding) ([#2304](https://github.com/agentscope-ai/agentscope-java/pull/2304), [#2268](https://github.com/agentscope-ai/agentscope-java/issues/2268))
+- Isolate static subagent registries by runtime context to prevent multi-tenant crosstalk ([#2371](https://github.com/agentscope-ai/agentscope-java/pull/2371), [#2328](https://github.com/agentscope-ai/agentscope-java/issues/2328))
+- Retain prior summaries in chained compaction to preserve user intent ([#2360](https://github.com/agentscope-ai/agentscope-java/pull/2360))
+- Preserve skill isolation and tool result history ([#2319](https://github.com/agentscope-ai/agentscope-java/pull/2319))
+- `RemoteFilesystem` recursive glob matches files at the search root ([#2343](https://github.com/agentscope-ai/agentscope-java/pull/2343))
+- Mark optional FilesystemTool params as `required=false` ([#2227](https://github.com/agentscope-ai/agentscope-java/pull/2227))
+- Optimize shell-execute `working_directory` parameter and tool usage hints ([#2107](https://github.com/agentscope-ai/agentscope-java/pull/2107))
+- Declared subagents inherit parent `modelExecutionConfig` / `toolExecutionConfig` ([#2252](https://github.com/agentscope-ai/agentscope-java/pull/2252))
+- Correct `sessionId` parameter description ([#2195](https://github.com/agentscope-ai/agentscope-java/pull/2195))
+
+**Storage / Transport**
+
+- PostgreSQL BaseStore schema support ([#2273](https://github.com/agentscope-ai/agentscope-java/pull/2273), [#2192](https://github.com/agentscope-ai/agentscope-java/issues/2192))
+- Fix PostgreSQL upsert SQL syntax error ([#2167](https://github.com/agentscope-ai/agentscope-java/pull/2167), [#2166](https://github.com/agentscope-ai/agentscope-java/issues/2166))
+- Fix `JdkHttpTransport` SSE stream being cut by absolute timeouts ([#1322](https://github.com/agentscope-ai/agentscope-java/pull/1322), [#1302](https://github.com/agentscope-ai/agentscope-java/issues/1302))
+
+**Spring Boot / Examples**
+
+- Fix Spring Boot starter package name ([#2264](https://github.com/agentscope-ai/agentscope-java/pull/2264))
+- Use raw DashScope model names in examples (drop invalid `dashscope:` prefix) ([#2318](https://github.com/agentscope-ai/agentscope-java/pull/2318))
+- Correct DashScope model name in `RuntimeContextExample` ([#2228](https://github.com/agentscope-ai/agentscope-java/pull/2228), [#2229](https://github.com/agentscope-ai/agentscope-java/issues/2229))
+- Correct skill example resource path ([#2250](https://github.com/agentscope-ai/agentscope-java/pull/2250))
+- Improve docs and examples ([#2508](https://github.com/agentscope-ai/agentscope-java/pull/2508))
+
+### Documentation
+
+- Add Agent Evolution to the Java 2.0 feature list in README ([#2494](https://github.com/agentscope-ai/agentscope-java/pull/2494))
+- Clarify that the all-in-one dependency includes model providers ([#2425](https://github.com/agentscope-ai/agentscope-java/pull/2425), [#840](https://github.com/agentscope-ai/agentscope-java/issues/840))
+- Fix documentation link redirects ([#2203](https://github.com/agentscope-ai/agentscope-java/pull/2203), [#2198](https://github.com/agentscope-ai/agentscope-java/issues/2198))
+- Generate version-scoped `llms.txt` artifacts (`/v1`, `/v2`) ([#2188](https://github.com/agentscope-ai/agentscope-java/pull/2188), [#2185](https://github.com/agentscope-ai/agentscope-java/issues/2185))
+- Document model builder customizers ([#2092](https://github.com/agentscope-ai/agentscope-java/pull/2092))
+- Update model documentation ([#2100](https://github.com/agentscope-ai/agentscope-java/pull/2100))
+- Correct README doc links and release notes URLs ([#2099](https://github.com/agentscope-ai/agentscope-java/pull/2099))
+- Update AG-UI documentation ([#2274](https://github.com/agentscope-ai/agentscope-java/pull/2274))
 
 ---
 
@@ -13,7 +228,7 @@ This page tracks per-version changes for AgentScope Java 2.0. For the overall mi
 
 AgentScope Java 2.0.0 is now Generally Available. This is the first production-ready release of the 2.0 line, marking a milestone in AgentScope Java's evolution from "transparent development" to "system engineering."
 
-**Quick links:** [Quickstart](../quickstart.md) | [V1 Migration Guide](../change-log.md) | [Going to Production](going-to-production.md)
+**Quick links:** [Quickstart](/v2/en/docs/quickstart) | [V1 Migration Guide](/v2/en/docs/change-log) | [Going to Production](/v2/en/docs/others/going-to-production)
 
 ### 2.0 Core Design Overview
 
@@ -274,7 +489,7 @@ The following are incremental changes between 2.0.0-RC5 (2026-07-07) and the GA 
 
 ### Added
 
-- **`projectWritable` mode** (`LocalFilesystemSpec`) — when enabled, the agent's file writes are routed by path: workspace metadata (`MEMORY.md`, `agents/`, `skills/`, etc.) goes to workspace; everything else (code, configs) lands in the project directory. Designed for code-generation agents. See [Filesystem · Project-writable mode](../harness/filesystem.md#project-writable-mode-projectwritable)
+- **`projectWritable` mode** (`LocalFilesystemSpec`) — when enabled, the agent's file writes are routed by path: workspace metadata (`MEMORY.md`, `agents/`, `skills/`, etc.) goes to workspace; everything else (code, configs) lands in the project directory. Designed for code-generation agents. See [Filesystem · Project-writable mode](/v2/en/docs/harness/filesystem#project-writable-mode-projectwritable)
 - **Runtime permission mode switching** — new `HarnessAgent.setPermissionMode()` / `getPermissionMode()` for dynamically adjusting the permission mode per session at runtime
 - **Subagent event stream forwarding** — `streamEvents()` now forwards child agent intermediate events (`TextBlockDelta`, `ToolCallStart`, etc.) in real time, each carrying a `source` path identifying the originating agent
 - **`AgentEvent.source` field** — all `AgentEvent` instances now carry a `source` field to distinguish main agent events (`source = null`) from sub agent events (`source = "main/researcher"` path format) within the same event stream, enabling consumer-side demuxing without extra state
@@ -314,4 +529,4 @@ First 2.0 Release Candidate. Contains the full architectural upgrade from 1.x:
 - Enterprise-grade distributed deployment (multi-tenant isolation, sandbox execution, permission system, session recovery)
 - Core framework redesign (event stream, message model, Middleware, HITL)
 
-For the complete 1.x → 2.0 change list, see the [V1 Migration Guide](../change-log.md).
+For the complete 1.x → 2.0 change list, see the [V1 Migration Guide](/v2/en/docs/change-log).

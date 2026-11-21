@@ -8,7 +8,7 @@ AgentScope Paw 是 [QwenPaw] 的 Java 版本 —— 一款装在你自己电脑�
 
 它擅长的另一件事，是**直接出现在你已经在用的地方**。开箱即支持钉钉、企业微信、飞书、GitHub 和 GitLab，所以你可以从一条 DM、或者一个 Issue 评论里 @ 它，不必再多开一个网页。
 
-paw 故意不去做更多的事 —— 没有登录、没有多租户隔离、没有 Docker sandbox、不做横向扩展。如果你需要这些 —— 想把 paw 风格的 agent 托管给一个团队，或者想让 agent 跑不可信代码而互相隔离 —— 请看姊妹项目 [agentscope-builder](../agentscope-builder/) 和 [agentscope-dataagent](../agentscope-dataagent/)。
+paw 故意不去做更多的事 —— 没有登录、没有多租户隔离、没有 Docker sandbox、不做横向扩展。如果需要具备 sandbox 隔离的助手，请看 [agentscope-dataagent](../agentscope-dataagent/)。
 
 ### 一览
 
@@ -69,9 +69,10 @@ java -jar agentscope-examples/agents/agentscope-paw/target/agentscope-paw-*.jar
 所有持久化状态都放在 `${paw.home}` 下（默认 `~/.agentscope`）：
 
 ```
-~/.agentscope/
+~/.agentscope/claw/          # 默认 ${claw.home}；可用 CLAW_HOME 覆盖
 ├── agentscope.json          # 内置 agent 定义
-├── agents.json              # 自定义 agent 目录（JSON 文件）
+├── agents.json              # 自定义 agent 目录
+├── workspace/               # 默认 main agent 工作区（自动生成配置时）
 └── agents/
     └── <agentId>/
         ├── workspace/       # AGENTS.md, skills/, subagents/, tools.json, memory/, …
@@ -167,8 +168,23 @@ UI 上点 **New agent** 按钮可以基于空白脚手架、内置模板或 AI �
 
 如果你自己提供了 `Model` Spring Bean（例如再 `@Import` 一个 `@Configuration`），自动注入的 DashScope 模型会被跳过。
 
+## 原生会话历史
+
+Harness 默认在 Workspace Filesystem 的私有分区保存原生 Thread 日志。Paw 历史页面通过 `threadTranscript()` 读取这些记录。原生日志文件请通过 ThreadJournal API 读取，不能作为 JSONL 文本直接解析。
+
+```bash
+# 可选：为所有 Agent 配置共享原生日志根；不设置时使用各自 Workspace 后端。
+export CLAW_SESSION_LOG_ROOT=/data/paw-session-history
+```
+
+| 配置项 | 环境变量 | 默认值 |
+| --- | --- | --- |
+| `claw.session-log.root` | `CLAW_SESSION_LOG_ROOT` | 空，使用 Workspace 后端 |
+
+自定义存储可提供 `ThreadJournalStore` Spring Bean；它会同时应用于内置和动态 Agent。完整存储、恢复与 SSE 说明见[会话日志指南](../../../docs/dev/zh/docs/harness/session-log.md)。
+
 ## 这个 fork 不再做的事
 
-agentscope-paw 之前曾支持多租户部署、JWT 登录、按用户切分 workspace 命名空间、Docker sandbox 隔离、agent 共享。这些能力已经全部从 paw 中剥离 —— 详见 [`builder.md`](builder.md)，里面给出了被移除的模块清单以及从 git 历史中找回的方法。也可以直接迁到 [agentscope-builder](../agentscope-builder/) —— 那是 paw 多租户能力的正式归宿。
+agentscope-paw 之前曾支持多租户部署、JWT 登录、按用户切分 workspace 命名空间、Docker sandbox 隔离、agent 共享。这些能力已经全部从 paw 中剥离 —— 详见 [`builder.md`](builder.md)，里面给出了被移除的模块清单以及从 git 历史中找回的方法。
 
 [AgentScope Java]: https://github.com/agentscope-ai/agentscope-java

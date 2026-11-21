@@ -19,10 +19,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.agentscope.core.agent.CapabilitySurface;
+import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolResultBlock;
+import io.agentscope.core.message.ToolResultState;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.model.ToolSchema;
 import io.agentscope.core.tool.test.SampleTools;
 import io.agentscope.core.tool.test.ToolTestUtils;
 import io.agentscope.core.util.JsonUtils;
@@ -53,6 +57,16 @@ class ToolExecutorTest {
 
     private Toolkit toolkit;
 
+    /**
+     * Direct-execution tests bypass the agent {@code call()} entry, so the grant layer's
+     * fail-closed semantics would deny every backend tool. Seed ALLOW_ALL explicitly.
+     */
+    private static RuntimeContext grantRc() {
+        RuntimeContext rc = RuntimeContext.empty();
+        rc.put(CapabilitySurface.class, CapabilitySurface.ALLOW_ALL);
+        return rc;
+    }
+
     @BeforeEach
     void setUp() {
         toolkit = new Toolkit();
@@ -81,7 +95,8 @@ class ToolExecutorTest {
                         .build();
 
         List<ToolResultBlock> responses =
-                toolkit.callTools(List.of(addCall, concatCall), null, null, null).block(TIMEOUT);
+                toolkit.callTools(List.of(addCall, concatCall), null, null, grantRc())
+                        .block(TIMEOUT);
 
         assertNotNull(responses, "Executor should return responses for tool calls");
         assertEquals(2, responses.size(), "All tool calls should be executed");
@@ -102,6 +117,115 @@ class ToolExecutorTest {
     }
 
     @Test
+    @DisplayName("Should execute input-only tool call when raw content is absent")
+    void shouldExecuteInputOnlyToolCallWithoutContent() {
+        ToolUseBlock addCall =
+                ToolUseBlock.builder()
+                        .id("call-input-only")
+                        .name("add")
+                        .input(Map.of("a", 10, "b", 20))
+                        .build();
+
+        ToolResultBlock response =
+                toolkit.callTool(ToolCallParam.builder().toolUseBlock(addCall).build())
+                        .block(TIMEOUT);
+
+        assertNotNull(response, "Executor should return a response for input-only calls");
+        assertEquals(
+                "30",
+                extractFirstText(response),
+                "Schema validation must validate the parsed input when raw content is absent");
+    }
+
+    @Test
+    @DisplayName("Should not execute malformed-argument calls through direct Toolkit paths")
+    void shouldNotExecuteMalformedCallWithPartialInput() {
+        // A truncated call carries merged input beside the malformed marker — the merged args
+        // can even look complete; the executor must refuse the call like the agent loop
+        // does, instead of executing it from that input.
+        ToolUseBlock truncated =
+                ToolUseBlock.builder()
+                        .id("call-malformed")
+                        .name("add")
+                        .input(Map.of("a", 10, "b", 20))
+                        .content("{}")
+                        .metadata(Map.of(ToolUseBlock.METADATA_MALFORMED_ARGUMENTS, true))
+                        .build();
+
+        ToolResultBlock response =
+                toolkit.callTool(ToolCallParam.builder().toolUseBlock(truncated).build())
+                        .block(TIMEOUT);
+
+        assertNotNull(response);
+        assertEquals(
+                ToolResultState.ERROR,
+                response.getState(),
+                "malformed calls must be refused, not executed from merged input: "
+                        + extractFirstText(response));
+        // The guard must be the rejecting layer here: "{}" content would also fail schema
+        // validation (add's parameters are required), so the message pins which one fired.
+        assertTrue(
+                extractFirstText(response).contains("malformed"),
+                "expected the malformed guard, got: " + extractFirstText(response));
+    }
+
+    @Test
+    @DisplayName("Should not execute malformed calls with blank content through direct Toolkit")
+    void shouldNotExecuteMalformedCallWithBlankContent() {
+        // Marker with no usable content must resolve to "{}" (not fall back to the merged
+        // input), keeping direct Toolkit paths aligned with the agent loop's refusal.
+        ToolUseBlock truncated =
+                ToolUseBlock.builder()
+                        .id("call-malformed-blank")
+                        .name("add")
+                        .input(Map.of("a", 10, "b", 20))
+                        .metadata(Map.of(ToolUseBlock.METADATA_MALFORMED_ARGUMENTS, true))
+                        .build();
+
+        ToolResultBlock response =
+                toolkit.callTool(ToolCallParam.builder().toolUseBlock(truncated).build())
+                        .block(TIMEOUT);
+
+        assertNotNull(response);
+        assertEquals(
+                ToolResultState.ERROR,
+                response.getState(),
+                "malformed calls with blank content must not execute from merged input: "
+                        + extractFirstText(response));
+        assertTrue(
+                extractFirstText(response).contains("malformed"),
+                "expected the malformed guard, got: " + extractFirstText(response));
+    }
+
+    @Test
+    @DisplayName("Should not execute malformed calls with valid content through direct Toolkit")
+    void shouldNotExecuteMalformedCallWithValidContent() {
+        // The merged input beside a malformed marker can coincidentally form a complete,
+        // schema-valid object; execution must still be refused like the agent loop does,
+        // instead of running a call whose raw arguments were truncated or corrupt.
+        ToolUseBlock truncated =
+                ToolUseBlock.builder()
+                        .id("call-malformed-valid")
+                        .name("add")
+                        .input(Map.of("a", 10, "b", 20))
+                        .content("{\"a\":10,\"b\":20}")
+                        .metadata(Map.of(ToolUseBlock.METADATA_MALFORMED_ARGUMENTS, true))
+                        .build();
+
+        ToolResultBlock response =
+                toolkit.callTool(ToolCallParam.builder().toolUseBlock(truncated).build())
+                        .block(TIMEOUT);
+
+        assertNotNull(response);
+        assertEquals(
+                ToolResultState.ERROR,
+                response.getState(),
+                "malformed calls must not execute even when the merged input looks complete:"
+                        + " "
+                        + extractFirstText(response));
+    }
+
+    @Test
     @DisplayName("Should wrap tool errors inside executor response")
     void shouldReturnErrorWhenToolThrows() {
         Map<String, Object> errorInput = Map.of("message", "test failure");
@@ -114,7 +238,7 @@ class ToolExecutorTest {
                         .build();
 
         List<ToolResultBlock> responses =
-                toolkit.callTools(List.of(errorCall), null, null, null).block(TIMEOUT);
+                toolkit.callTools(List.of(errorCall), null, null, grantRc()).block(TIMEOUT);
 
         assertNotNull(responses, "Executor should return an error response");
         assertEquals(1, responses.size(), "Single failing call should yield one response");
@@ -162,7 +286,7 @@ class ToolExecutorTest {
                         .build();
 
         List<ToolResultBlock> responses =
-                toolkit.callTools(List.of(emptyCall), null, null, null).block(TIMEOUT);
+                toolkit.callTools(List.of(emptyCall), null, null, grantRc()).block(TIMEOUT);
 
         assertNotNull(responses, "Executor should return an error response");
         assertEquals(1, responses.size(), "Empty completion should still yield one response");
@@ -171,6 +295,137 @@ class ToolExecutorTest {
         assertEquals(
                 "Error: Tool execution failed: Tool completed without returning a result",
                 extractFirstText(responses.get(0)));
+    }
+
+    @Test
+    @DisplayName("Should return suspended result for external tools")
+    void shouldReturnSuspendedResultForExternalTools() {
+        toolkit.registerSchema(
+                ToolSchema.builder()
+                        .name("external_api")
+                        .description("Execute API outside the agent runtime")
+                        .parameters(
+                                Map.of(
+                                        "type",
+                                        "object",
+                                        "properties",
+                                        Map.of("endpoint", Map.of("type", "string"))))
+                        .build());
+
+        Map<String, Object> input = Map.of("endpoint", "/users");
+        ToolUseBlock externalCall =
+                ToolUseBlock.builder()
+                        .id("call-external")
+                        .name("external_api")
+                        .input(input)
+                        .content(JsonUtils.getJsonCodec().toJson(input))
+                        .build();
+
+        List<ToolResultBlock> responses =
+                toolkit.callTools(List.of(externalCall), null, null, grantRc()).block(TIMEOUT);
+
+        assertNotNull(responses, "Executor should return a suspended response");
+        assertEquals(1, responses.size(), "Single external call should yield one response");
+
+        ToolResultBlock response = responses.get(0);
+        assertEquals("call-external", response.getId(), "Response should keep tool call id");
+        assertEquals("external_api", response.getName(), "Response should keep tool name");
+        assertTrue(response.isSuspended(), "External tool should surface as suspended");
+        assertEquals(ToolResultState.SUSPENDED, response.getState());
+        assertTrue(
+                response.getOutput().isEmpty(),
+                "External tool suspension must not fabricate output");
+    }
+
+    @Test
+    @DisplayName("Should validate external tool input before suspension")
+    void shouldValidateExternalToolInputBeforeSuspension() {
+        toolkit.registerSchema(
+                ToolSchema.builder()
+                        .name("external_api")
+                        .description("Execute API outside the agent runtime")
+                        .parameters(
+                                Map.of(
+                                        "type",
+                                        "object",
+                                        "properties",
+                                        Map.of("endpoint", Map.of("type", "string")),
+                                        "required",
+                                        List.of("endpoint")))
+                        .build());
+
+        Map<String, Object> input = Map.of("endpoint", 42);
+        ToolUseBlock invalidExternalCall =
+                ToolUseBlock.builder()
+                        .id("call-invalid-external")
+                        .name("external_api")
+                        .input(input)
+                        .content(JsonUtils.getJsonCodec().toJson(input))
+                        .build();
+
+        List<ToolResultBlock> responses =
+                toolkit.callTools(List.of(invalidExternalCall), null, null, grantRc())
+                        .block(TIMEOUT);
+
+        assertNotNull(responses, "Executor should return a validation response");
+        assertEquals(1, responses.size(), "Single external call should yield one response");
+
+        ToolResultBlock response = responses.get(0);
+        assertEquals(
+                "call-invalid-external", response.getId(), "Response should keep tool call id");
+        assertEquals("external_api", response.getName(), "Response should keep tool name");
+        assertTrue(!response.isSuspended(), "Invalid external input must not suspend");
+
+        String errorText = extractFirstText(response);
+        assertTrue(
+                errorText.startsWith("Error: Parameter validation failed for tool 'external_api'"),
+                "External tool should fail validation before suspension: " + errorText);
+    }
+
+    @Test
+    @DisplayName("Should reject inactive grouped external tools before suspension")
+    void shouldRejectInactiveGroupedExternalToolsBeforeSuspension() {
+        toolkit.createToolGroup("inactiveExternal", "Inactive external tools", false);
+        toolkit.registration()
+                .agentTool(
+                        new SchemaOnlyTool(
+                                ToolSchema.builder()
+                                        .name("external_inactive")
+                                        .description("Inactive external API")
+                                        .parameters(
+                                                Map.of(
+                                                        "type",
+                                                        "object",
+                                                        "properties",
+                                                        Map.of(
+                                                                "endpoint",
+                                                                Map.of("type", "string"))))
+                                        .build()))
+                .group("inactiveExternal")
+                .apply();
+
+        Map<String, Object> input = Map.of("endpoint", "/users");
+        ToolUseBlock externalCall =
+                ToolUseBlock.builder()
+                        .id("call-inactive-external")
+                        .name("external_inactive")
+                        .input(input)
+                        .content(JsonUtils.getJsonCodec().toJson(input))
+                        .build();
+
+        List<ToolResultBlock> responses =
+                toolkit.callTools(List.of(externalCall), null, null, grantRc()).block(TIMEOUT);
+
+        assertNotNull(responses, "Executor should return an authorization response");
+        assertEquals(1, responses.size(), "Single external call should yield one response");
+
+        ToolResultBlock response = responses.get(0);
+        assertEquals("call-inactive-external", response.getId(), "Response should keep call id");
+        assertEquals("external_inactive", response.getName(), "Response should keep tool name");
+        assertTrue(!response.isSuspended(), "Inactive external tool must not suspend");
+        assertEquals(
+                "Error: Unauthorized tool call: 'external_inactive' is not available",
+                extractFirstText(response));
     }
 
     @Test
@@ -216,7 +471,7 @@ class ToolExecutorTest {
                         .build();
 
         List<ToolResultBlock> responses =
-                toolkit.callTools(List.of(interruptedCall), null, null, null).block(TIMEOUT);
+                toolkit.callTools(List.of(interruptedCall), null, null, grantRc()).block(TIMEOUT);
 
         assertNotNull(responses, "Should return error response");
         assertEquals(1, responses.size(), "Should have one response");
@@ -296,7 +551,8 @@ class ToolExecutorTest {
                         .build();
 
         List<ToolResultBlock> responses =
-                toolkit.callTools(List.of(call1, call2, call3), null, null, null).block(TIMEOUT);
+                toolkit.callTools(List.of(call1, call2, call3), null, null, grantRc())
+                        .block(TIMEOUT);
 
         assertNotNull(responses, "Should return responses");
         assertEquals(3, responses.size(), "Should have three responses");
@@ -353,6 +609,7 @@ class ToolExecutorTest {
                                 ToolCallParam.builder()
                                         .toolUseBlock(toolCall)
                                         .input(explicitInput)
+                                        .runtimeContext(grantRc())
                                         .build())
                         .block(TIMEOUT);
 
@@ -387,7 +644,11 @@ class ToolExecutorTest {
                         .build();
 
         ToolResultBlock result =
-                toolkit.callTool(ToolCallParam.builder().toolUseBlock(toolCall).build())
+                toolkit.callTool(
+                                ToolCallParam.builder()
+                                        .toolUseBlock(toolCall)
+                                        .runtimeContext(grantRc())
+                                        .build())
                         .block(TIMEOUT);
 
         assertNotNull(result, "Result should not be null");
@@ -446,7 +707,11 @@ class ToolExecutorTest {
                         .build();
 
         ToolResultBlock result =
-                executor.execute(ToolCallParam.builder().toolUseBlock(toolCall).build())
+                executor.execute(
+                                ToolCallParam.builder()
+                                        .toolUseBlock(toolCall)
+                                        .runtimeContext(grantRc())
+                                        .build())
                         .block(TIMEOUT);
 
         assertNotNull(result, "Result should not be null");
@@ -522,7 +787,7 @@ class ToolExecutorTest {
                         .build();
 
         List<ToolResultBlock> responses =
-                toolkit.callTools(List.of(npeCall, argCall), null, null, null).block(TIMEOUT);
+                toolkit.callTools(List.of(npeCall, argCall), null, null, grantRc()).block(TIMEOUT);
 
         assertNotNull(responses, "Should return responses");
         assertEquals(2, responses.size(), "Should have two responses");
