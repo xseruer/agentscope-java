@@ -33,8 +33,11 @@ import io.agentscope.core.model.GenerateOptions;
 import io.agentscope.core.model.Model;
 import io.agentscope.core.model.ToolSchema;
 import io.agentscope.harness.agent.memory.compaction.ConversationCompactor;
+import io.agentscope.harness.agent.workspace.WorkspaceConstants;
 import io.agentscope.harness.agent.workspace.WorkspaceManager;
 import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -138,6 +141,39 @@ class MemoryFlushManagerTest {
                         "[document: spec.docx, application/msword, url:"
                                 + " https://example.com/spec.docx]"),
                 "tool-result documents must reach the flush prompt: " + userPrompt);
+    }
+
+    @Test
+    void flushMemories_capsOversizedMemoryAndDailyLedger() {
+        RecordingModel model = new RecordingModel();
+        RuntimeContext rc = RuntimeContext.builder().sessionId("session-1").build();
+        String filler = "x".repeat(MemoryFlushManager.MAX_CONTEXT_CHARS * 2);
+        String dailyRelPath =
+                WorkspaceConstants.MEMORY_DIR
+                        + "/"
+                        + LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
+                        + ".md";
+
+        try (WorkspaceManager workspaceManager = new WorkspaceManager(workspace)) {
+            workspaceManager.writeMemoryFileUtf8(
+                    rc, WorkspaceConstants.MEMORY_MD, "# Curated\n" + filler + "\n- cut tail");
+            workspaceManager.writeMemoryFileUtf8(
+                    rc, dailyRelPath, "- cut head\n" + filler + "\n- fresh entry");
+
+            MemoryFlushManager flushManager = new MemoryFlushManager(workspaceManager, model);
+
+            flushManager
+                    .flushMemories(rc, List.of(message(MsgRole.USER, "real follow-up")))
+                    .block();
+        }
+
+        String userPrompt = model.userPrompt(0);
+        assertTrue(userPrompt.contains("# Curated"), "MEMORY.md keeps its head");
+        assertFalse(userPrompt.contains("- cut tail"));
+        assertTrue(userPrompt.contains("- fresh entry"), "the daily ledger keeps its tail");
+        assertFalse(userPrompt.contains("- cut head"));
+        assertTrue(userPrompt.contains("omitted"));
+        assertTrue(userPrompt.contains("real follow-up"));
     }
 
     private static Msg message(MsgRole role, String text) {

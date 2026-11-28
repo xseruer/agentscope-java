@@ -189,6 +189,71 @@ class MemoryConsolidatorCommitGateTest {
     }
 
     // ======================================================================
+    // Oversized inputs: an oversized MEMORY.md or ledger must not fail the merge, which
+    // is the only step that can shrink MEMORY.md again.
+    // ======================================================================
+
+    @Test
+    void oversizedMemoryAndLedgerAreCappedAndStillCommit() throws Exception {
+        InMemoryStore store = new InMemoryStore();
+        List<String> ns = List.of("gate-test");
+        RemoteFilesystem fs = new RemoteFilesystem(store, ns);
+        String filler = "x".repeat(MemoryConsolidator.INPUT_CAP_FLOOR_CHARS * 2);
+        seedFile(store, ns, "MEMORY.md", "# Curated\n- old fact\n" + filler + "\n- cut tail");
+        seedDailyLedger(store, ns, "- cut head\n" + filler + "\n- fresh fact");
+
+        ScriptedModel model =
+                new ScriptedModel(
+                        List.of(
+                                Flux.just(
+                                        textChunk("# Curated\n- fresh fact"),
+                                        finishChunk("stop"))));
+
+        try (WorkspaceManager wsm = new WorkspaceManager(workspace, fs)) {
+            RuntimeContext rc = RuntimeContext.empty();
+            MemoryConsolidator consolidator = new MemoryConsolidator(wsm, model, 4000);
+            consolidator.consolidate(rc).block();
+
+            String userPrompt = text(model.inputs.get(0).get(1));
+            assertTrue(userPrompt.contains("- old fact"), "MEMORY.md keeps its head");
+            assertFalse(userPrompt.contains("- cut tail"));
+            assertTrue(userPrompt.contains("- fresh fact"), "the ledger keeps its tail");
+            assertFalse(userPrompt.contains("- cut head"));
+            assertEquals("# Curated\n- fresh fact", wsm.readMemoryMd(rc));
+            assertTrue(consolidator.readWatermark(rc).isAfter(Instant.EPOCH));
+        }
+    }
+
+    @Test
+    void memoryWithinBodyTargetIsNotCut() throws Exception {
+        InMemoryStore store = new InMemoryStore();
+        List<String> ns = List.of("gate-test");
+        RemoteFilesystem fs = new RemoteFilesystem(store, ns);
+        // Above the floor, but inside a 30k-token body target (120k chars).
+        String memory =
+                "# Curated\n" + "x".repeat(MemoryConsolidator.INPUT_CAP_FLOOR_CHARS + 1_000);
+        seedFile(store, ns, "MEMORY.md", memory);
+        seedDailyLedger(store, ns, "- fresh fact");
+
+        ScriptedModel model =
+                new ScriptedModel(
+                        List.of(
+                                Flux.just(
+                                        textChunk("# Curated\n- fresh fact"),
+                                        finishChunk("stop"))));
+
+        try (WorkspaceManager wsm = new WorkspaceManager(workspace, fs)) {
+            new MemoryConsolidator(wsm, model, 30_000).consolidate(RuntimeContext.empty()).block();
+        }
+
+        assertTrue(text(model.inputs.get(0).get(1)).contains(memory));
+    }
+
+    private static String text(Msg message) {
+        return ((TextBlock) message.getContent().get(0)).getText();
+    }
+
+    // ======================================================================
     // Tool-call / mixed output is not a valid MEMORY.md body: refused.
     // ======================================================================
 

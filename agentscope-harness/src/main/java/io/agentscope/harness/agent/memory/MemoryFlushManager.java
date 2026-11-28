@@ -103,6 +103,12 @@ public class MemoryFlushManager {
             individually.\
             """;
 
+    /**
+     * Cap on each of the two read-only deduplication contexts, in characters. Together they
+     * stay within the harness's 64k-token fallback input budget, leaving room for the window.
+     */
+    static final int MAX_CONTEXT_CHARS = 32_000;
+
     private final WorkspaceManager workspaceManager;
     private final Model model;
     private final String flushPrompt;
@@ -125,7 +131,8 @@ public class MemoryFlushManager {
      * Extracts long-term memories from messages using the model and writes them to disk.
      *
      * <p>Provides existing MEMORY.md and today's daily file content to the extraction LLM
-     * so it can effectively deduplicate and avoid re-extracting known facts.
+     * so it can effectively deduplicate and avoid re-extracting known facts. Each is capped
+     * at {@link #MAX_CONTEXT_CHARS}.
      */
     public Mono<Void> flushMemories(RuntimeContext rc, List<Msg> messages) {
         String conversationText = serializeMessages(messages);
@@ -133,10 +140,16 @@ public class MemoryFlushManager {
             return Mono.empty();
         }
 
-        String existingMemory = readExistingContent(rc, WorkspaceConstants.MEMORY_MD);
+        String existingMemory =
+                MemoryInputBudget.head(
+                        "MEMORY.md",
+                        readExistingContent(rc, WorkspaceConstants.MEMORY_MD),
+                        MAX_CONTEXT_CHARS);
         String today = LocalDate.now(clock(rc)).format(DateTimeFormatter.ISO_LOCAL_DATE);
         String dailyRelPath = WorkspaceConstants.MEMORY_DIR + "/" + today + ".md";
-        String existingDaily = readExistingContent(rc, dailyRelPath);
+        String existingDaily =
+                MemoryInputBudget.tail(
+                        dailyRelPath, readExistingContent(rc, dailyRelPath), MAX_CONTEXT_CHARS);
 
         StringBuilder userPrompt = new StringBuilder();
         if (!existingMemory.isBlank()) {

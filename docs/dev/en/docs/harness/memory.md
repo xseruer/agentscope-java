@@ -66,6 +66,8 @@ Per-call long-term memory flush runs in the background; pre-compaction flush bel
 
 Flush appends extracted text only after the complete extraction stream finishes normally. Explicit output-limit termination such as `length`, output containing tool blocks even when mixed with text, empty output, `NO_REPLY`, model errors and cancellation do not append partial text to the daily ledger. A missing finish reason remains accepted for older providers that do not report it. If useful facts were not saved, retrieve them from the conversation history and save the confirmed facts explicitly rather than treat a partial extraction as durable memory.
 
+Replayed to Flush as deduplication context, `MEMORY.md` keeps only its leading 32,000 characters and today's ledger only its trailing 32,000 characters; the cut is marked in the prompt and logged at WARN. `MEMORY.md` is meant to be size-bounded by consolidation, but entries appended directly by `memory_save` are not. Without that cap, once the files outgrow the model's input window, flush and consolidation keep failing together and `MEMORY.md` can never shrink again.
+
 <span id="enable-compaction" />
 
 ## Tune context compaction
@@ -298,6 +300,8 @@ When memory is enabled, a throttled background job also runs. The first eligible
 Entering maintenance does not necessarily call the model: consolidation skips the LLM request when there are no new daily ledger entries since the last successful consolidation. `FlushTrigger.never()` does not disable this maintenance path.
 
 Consolidation still requires a complete, non-empty, text-only result within the configured memory-body budget before replacing `MEMORY.md`. It advances the watermark marking processed ledger entries only after confirming the write by reading the file back. If confirmation fails, the body may already have been written, but the watermark stays unchanged so the next maintenance pass retries those entries. Do not interpret a write attempt alone as a completed consolidation.
+
+The consolidation input is bounded the same way: the current `MEMORY.md` keeps only its leading 60,000 characters and the new ledger entries only their trailing 60,000 characters (the `MEMORY.md` cap is never below its body target, so a memory within target is not cut). Earlier ledger entries cut here are never merged, because the watermark moves past them.
 
 All thresholds are tunable via `.memory(MemoryConfig.builder()...)`, though most projects don't need to touch them.
 

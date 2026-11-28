@@ -130,6 +130,12 @@ public class MemoryConsolidator {
     private static final String WATERMARK_KEY = "watermark";
     private static final int MAX_CAS_RETRIES = 5;
 
+    /**
+     * Floor of the cap on each merged input (current memory, new daily entries), in
+     * characters. Together they stay within the harness's 64k-token fallback input budget.
+     */
+    static final int INPUT_CAP_FLOOR_CHARS = 60_000;
+
     private final WorkspaceManager workspaceManager;
     private final Model model;
     private final String consolidationPrompt;
@@ -196,6 +202,13 @@ public class MemoryConsolidator {
 
         int maxChars = maxMemoryTokens * 4;
         String systemPrompt = String.format(consolidationPrompt, maxMemoryTokens, maxChars);
+
+        // A consolidated MEMORY.md never exceeds maxChars, so only an oversized one is cut.
+        // Earlier ledger entries cut here are never merged: the watermark moves past them.
+        currentMemory =
+                MemoryInputBudget.head(
+                        "MEMORY.md", currentMemory, Math.max(maxChars, INPUT_CAP_FLOOR_CHARS));
+        dailyEntries = MemoryInputBudget.tail("daily entries", dailyEntries, INPUT_CAP_FLOOR_CHARS);
 
         StringBuilder userContent = new StringBuilder();
         userContent.append("Current MEMORY.md:\n");
