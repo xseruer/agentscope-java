@@ -26,6 +26,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.http.HttpClient;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -208,6 +209,112 @@ class McpClientBuilderTest {
         assertEquals("test-sync-client", wrapper.getName());
         assertFalse(wrapper.isInitialized());
         assertTrue(wrapper instanceof McpSyncClientWrapper);
+    }
+
+    @Test
+    void testPropagateMeta_DefaultsToTrue() {
+        McpClientWrapper asyncWrapper =
+                McpClientBuilder.create("meta-default-async")
+                        .stdioTransport("echo", "hello")
+                        .buildAsync()
+                        .block();
+        assertNotNull(asyncWrapper);
+        assertTrue(asyncWrapper.isPropagateMeta());
+
+        McpClientWrapper syncWrapper =
+                McpClientBuilder.create("meta-default-sync")
+                        .stdioTransport("echo", "hello")
+                        .buildSync();
+        assertNotNull(syncWrapper);
+        assertTrue(syncWrapper.isPropagateMeta());
+    }
+
+    @Test
+    void testPropagateMeta_DisabledAppliedToBuiltWrappers() {
+        McpClientWrapper asyncWrapper =
+                McpClientBuilder.create("meta-off-async")
+                        .propagateMeta(false)
+                        .stdioTransport("echo", "hello")
+                        .buildAsync()
+                        .block();
+        assertNotNull(asyncWrapper);
+        assertFalse(asyncWrapper.isPropagateMeta());
+
+        McpClientWrapper syncWrapper =
+                McpClientBuilder.create("meta-off-sync")
+                        .propagateMeta(false)
+                        .stdioTransport("echo", "hello")
+                        .buildSync();
+        assertNotNull(syncWrapper);
+        assertFalse(syncWrapper.isPropagateMeta());
+    }
+
+    @Test
+    void testResultCustomizers_AppliedToBuiltWrappers() {
+        McpToolResultCustomizer first = (context, metadata) -> metadata.put("first", true);
+        McpToolResultCustomizer second = (context, metadata) -> metadata.put("second", true);
+        List<McpToolResultCustomizer> customizers = new ArrayList<>(List.of(first, second));
+
+        McpClientWrapper asyncWrapper =
+                McpClientBuilder.create("result-meta-async")
+                        .resultCustomizers(customizers)
+                        .stdioTransport("echo", "hello")
+                        .buildAsync()
+                        .block();
+        assertNotNull(asyncWrapper);
+        assertEquals(List.of(first, second), asyncWrapper.getResultCustomizers());
+
+        McpClientWrapper syncWrapper =
+                McpClientBuilder.create("result-meta-sync")
+                        .resultCustomizers(customizers)
+                        .stdioTransport("echo", "hello")
+                        .buildSync();
+        assertNotNull(syncWrapper);
+        assertEquals(List.of(first, second), syncWrapper.getResultCustomizers());
+
+        customizers.clear();
+        assertEquals(List.of(first, second), asyncWrapper.getResultCustomizers());
+        assertEquals(List.of(first, second), syncWrapper.getResultCustomizers());
+    }
+
+    @Test
+    void testResultCustomizers_VarargsApplyToBuiltWrapper() {
+        McpToolResultCustomizer first = (context, metadata) -> metadata.put("first", true);
+        McpToolResultCustomizer second = (context, metadata) -> metadata.put("second", true);
+
+        McpClientWrapper wrapper =
+                McpClientBuilder.create("result-meta-varargs")
+                        .resultCustomizers(first, second)
+                        .stdioTransport("echo", "hello")
+                        .buildSync();
+
+        assertEquals(List.of(first, second), wrapper.getResultCustomizers());
+        assertThrows(
+                UnsupportedOperationException.class,
+                () -> wrapper.getResultCustomizers().add(first));
+    }
+
+    @Test
+    void testResultCustomizers_NullConfigurationClearsPreviousValue() {
+        McpToolResultCustomizer customizer = (context, metadata) -> metadata.put("first", true);
+
+        McpClientWrapper nullListWrapper =
+                McpClientBuilder.create("result-meta-null-list")
+                        .resultCustomizers(List.of(customizer))
+                        .resultCustomizers((List<McpToolResultCustomizer>) null)
+                        .stdioTransport("echo", "hello")
+                        .buildSync();
+
+        assertTrue(nullListWrapper.getResultCustomizers().isEmpty());
+
+        McpClientWrapper nullVarargsWrapper =
+                McpClientBuilder.create("result-meta-null-varargs")
+                        .resultCustomizers(customizer)
+                        .resultCustomizers((McpToolResultCustomizer[]) null)
+                        .stdioTransport("echo", "hello")
+                        .buildSync();
+
+        assertTrue(nullVarargsWrapper.getResultCustomizers().isEmpty());
     }
 
     @Test

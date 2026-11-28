@@ -1,5 +1,5 @@
 server:
-  port: ${CLAW_PORT:8080}
+  port: ${CLAW_PORT:8090}
 
 spring:
   application:
@@ -14,7 +14,7 @@ spring:
 # agentscope-claw configuration
 #
 # All persistent state lives under ${claw.home} (default ~/.agentscope/claw),
-# isolating claw from other harness apps (builder, dataagent, codingagent)
+# isolating claw from other harness apps (dataagent, codingagent)
 # that also live under ~/.agentscope/.
 #
 #   ${claw.home}/agentscope.json              — built-in agent definitions
@@ -25,6 +25,11 @@ spring:
 # --------------------------------------------------------------------------
 claw:
   home: ${CLAW_HOME:#{systemProperties['user.home']}/.agentscope/claw}
+
+  # ---- Native session log ----
+  # Empty uses the workspace backend. A shared root can serve multiple agent instances.
+  session-log:
+    root: ${CLAW_SESSION_LOG_ROOT:}
 
   # ---- DashScope model (used when no Model Spring bean is present) ----
   # Set DASHSCOPE_API_KEY env var or override api-key below.

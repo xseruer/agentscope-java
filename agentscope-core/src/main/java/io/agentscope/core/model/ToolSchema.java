@@ -16,6 +16,8 @@
 
 package io.agentscope.core.model;
 
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.annotation.JsonPOJOBuilder;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -25,12 +27,15 @@ import java.util.Objects;
  * Immutable tool schema definition.
  * Describes a tool's interface using JSON Schema for parameters.
  */
+@JsonDeserialize(builder = ToolSchema.Builder.class)
 public class ToolSchema {
     private final String name;
     private final String description;
     private final Map<String, Object> parameters;
     private final Map<String, Object> outputSchema;
     private final Boolean strict;
+    private final Boolean deferLoading;
+    private final boolean toolSearch;
 
     /**
      * Creates a new ToolSchema instance using the builder pattern.
@@ -49,6 +54,8 @@ public class ToolSchema {
                         ? Collections.unmodifiableMap(new HashMap<>(builder.outputSchema))
                         : null;
         this.strict = builder.strict;
+        this.deferLoading = builder.deferLoading;
+        this.toolSearch = builder.toolSearch;
     }
 
     /**
@@ -96,6 +103,24 @@ public class ToolSchema {
         return strict;
     }
 
+    /** Whether this schema represents native client-executed tool search rather than a function. */
+    public boolean isToolSearch() {
+        return toolSearch;
+    }
+
+    /**
+     * Gets the deferred tool definition loading flag.
+     *
+     * <p>Providers that support tool search can defer loading this tool's parameter schema until
+     * the model searches for it. Returns {@code null} when unspecified, which leaves the tool
+     * eagerly loaded.
+     *
+     * @return true to defer loading, false otherwise, or null if not specified
+     */
+    public Boolean getDeferLoading() {
+        return deferLoading;
+    }
+
     /**
      * Creates a new builder for ToolSchema.
      *
@@ -108,12 +133,15 @@ public class ToolSchema {
     /**
      * Builder for creating ToolSchema instances.
      */
+    @JsonPOJOBuilder(withPrefix = "")
     public static class Builder {
         private String name;
         private String description;
         private Map<String, Object> parameters;
         private Map<String, Object> outputSchema;
         private Boolean strict;
+        private Boolean deferLoading;
+        private boolean toolSearch;
 
         /**
          * Sets the tool name.
@@ -167,6 +195,23 @@ public class ToolSchema {
          */
         public Builder strict(Boolean strict) {
             this.strict = strict;
+            return this;
+        }
+
+        /** Mark a native client-executed tool-search declaration. */
+        public Builder toolSearch(boolean toolSearch) {
+            this.toolSearch = toolSearch;
+            return this;
+        }
+
+        /**
+         * Sets the deferred tool definition loading flag.
+         *
+         * @param deferLoading whether to defer loading this tool's schema until tool search
+         * @return this builder instance
+         */
+        public Builder deferLoading(Boolean deferLoading) {
+            this.deferLoading = deferLoading;
             return this;
         }
 

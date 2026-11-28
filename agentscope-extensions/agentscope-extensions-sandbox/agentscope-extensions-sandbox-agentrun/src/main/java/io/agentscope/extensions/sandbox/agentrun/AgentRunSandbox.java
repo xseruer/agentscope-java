@@ -88,13 +88,15 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
 
     @Override
     public void shutdown() throws Exception {
+        // Match E2b/Daytona: a non-owned sandbox is shared/reused, so closing this adapter
+        // must not close its shared MCP channel.
+        if (!arState.isSandboxOwned()) {
+            return;
+        }
         try {
             mcp.close();
         } catch (Exception ignore) {
             // best-effort
-        }
-        if (!arState.isSandboxOwned()) {
-            return;
         }
         String id = arState.getSandboxId();
         if (id != null && !id.isBlank()) {
@@ -175,7 +177,7 @@ public class AgentRunSandbox extends AbstractBaseSandbox {
                 "import base64,pathlib,subprocess; d="
                         + jsonLiteral(root)
                         + "; raw=base64.standard_b64decode(pathlib.Path('/tmp/agentscope-ws.b64').read_text());"
-                        + " subprocess.run(['tar','xf','-','-C',d],input=raw,check=True)";
+                        + " subprocess.run(['tar','xpf','-','-C',d],input=raw,check=True)";
         AgentRunMcpChannel.ExecResult finRes =
                 mcp.exec("python3 -c " + shellSingleQuote(pyFin), null, TAR_TIMEOUT_SECONDS);
         if (finRes.exitCode != 0) {

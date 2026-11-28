@@ -20,7 +20,6 @@ import static io.agentscope.core.model.ModelProviderSupport.trimToNull;
 import static io.agentscope.extensions.model.openai.OpenAIModelProviderSupport.applyAdvancedOptions;
 
 import io.agentscope.core.model.Model;
-import io.agentscope.core.model.ModelContextWindows;
 import io.agentscope.core.model.ModelCreationContext;
 import io.agentscope.core.model.spi.ModelProvider;
 import io.agentscope.extensions.model.openai.formatter.OpenAIChatFormatter;
@@ -61,9 +60,12 @@ public final class OpenAIModelProvider implements ModelProvider {
                             + modelId);
         }
         String modelName = modelId.substring(PREFIX.length());
-        String baseUrl = firstNonBlank(context.getBaseUrl(), DEFAULT_BASE_URL);
+        String baseUrl =
+                firstNonBlank(
+                        context.getBaseUrl(), System.getenv("OPENAI_BASE_URL"), DEFAULT_BASE_URL);
         String endpointPath = trimToNull(context.getEndpointPath());
         boolean stream = context.getStream() != null ? context.getStream() : true;
+        boolean officialEndpoint = DEFAULT_BASE_URL.equals(baseUrl);
 
         OpenAIChatModel.Builder builder =
                 OpenAIChatModel.builder().apiKey(apiKey).modelName(modelName).stream(stream)
@@ -71,8 +73,7 @@ public final class OpenAIModelProvider implements ModelProvider {
                         .endpointPath(endpointPath)
                         .formatter(new OpenAIChatFormatter())
                         .nativeStructuredOutput(true)
-                        .contextWindowSize(
-                                ModelContextWindows.lookup(modelName, ModelContextWindows.OPENAI));
+                        .supportsToolChoiceSpecific(officialEndpoint);
         applyAdvancedOptions(builder, context);
         return builder.build();
     }
